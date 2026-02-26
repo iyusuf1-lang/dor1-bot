@@ -4,15 +4,52 @@ Dori Ma'lumot Boti v4.0 - Rasmiy ma'lumotlar bazasi
 O'zbekiston Respublikasi Sog'liqni Saqlash Vazirligi ma'lumotlari asosida
 """
 
-import asyncio
-import logging
+# Xatolarni oldini olish uchun - kutubxonalarni tekshirish
+import sys
+import subprocess
+import pkg_resources
 import os
+
+def check_and_install(package, install_name=None):
+    """Kutubxona borligini tekshirish va yo'q bo'lsa o'rnatish"""
+    if install_name is None:
+        install_name = package
+    
+    try:
+        dist = pkg_resources.get_distribution(package)
+        print(f"✅ {package} {dist.version} o'rnatilgan")
+    except pkg_resources.DistributionNotFound:
+        print(f"⚠️ {package} o'rnatilmagan, o'rnatilmoqda...")
+        subprocess.check_call([sys.executable, "-m", "pip", "install", install_name])
+        print(f"✅ {package} o'rnatildi")
+    except Exception as e:
+        print(f"⚠️ {package} tekshirishda xato: {e}")
+
+# Kerakli kutubxonalarni tekshirish va o'rnatish
+print("📦 Kutubxonalarni tekshirish...")
+required_packages = [
+    ("pandas", "pandas"),
+    ("openpyxl", "openpyxl"),
+    ("aiohttp", "aiohttp"),
+    ("telegram", "python-telegram-bot"),
+    ("bs4", "beautifulsoup4"),
+    ("lxml", "lxml"),
+    ("xlrd", "xlrd")
+]
+
+for pkg, install_name in required_packages:
+    check_and_install(pkg, install_name)
+
+# Endi import qilish
+import pandas as pd
+import logging
 import re
 import json
-import aiohttp
-import pandas as pd
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple, Any
+import aiohttp
+from bs4 import BeautifulSoup
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -38,8 +75,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Bot token
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+# Bot token - environment variable dan olish
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN topilmadi!")
+    logger.error("Railway.app -> Variables bo'limida BOT_TOKEN ni o'rnating")
+    sys.exit(1)
 
 # Conversation states
 (ASOSIY_MENYU, DORI_QIDIRISH, TEXNIKA_QIDIRISH, DIAGNOSTIKA_QIDIRISH) = range(4)
@@ -59,151 +101,243 @@ class MedicineDatabase:
         self.annulled_tech = []  # Annullangan texnika
         self.load_data()
     
+    def safe_str(self, value):
+        """Xavfsiz string olish"""
+        if pd.isna(value):
+            return ""
+        return str(value).strip()
+    
     def load_data(self):
         """Excel fayllardan ma'lumotlarni yuklash"""
         try:
+            # Mavjud fayllarni tekshirish
+            excel_files = [
+                "2. Субстанция .xls",
+                "3. Лек.пр.(in vivo).xls", 
+                "4. Мед.техника и мед.изд.xls",
+                "5. ИМН для in vitro диаг .xls",
+                "6. Аннул.лек.срва .xls",
+                "7. Аннул.изделия мед.назначения и медтехники.xls"
+            ]
+            
+            for file in excel_files:
+                if not os.path.exists(file):
+                    logger.warning(f"⚠️ {file} topilmadi")
+            
             # 1. Dori vositalari (substansiyalar)
             if os.path.exists("2. Субстанция .xls"):
-                df = pd.read_excel("2. Субстанция .xls", sheet_name="ПРОСМОТР")
-                for _, row in df.iterrows():
-                    if pd.notna(row.get("Торговое название и <br> синоним")):
-                        drug = {
-                            "name": str(row.get("Торговое название и <br> синоним", "")),
-                            "international": str(row.get("Международное название", "")),
-                            "form": str(row.get("Лекарственная форма выпуска", "")),
-                            "country": str(row.get("Страна-производитель", "")),
-                            "manufacturer": str(row.get("Фирма производитель", "")),
-                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
-                            "reg_date": str(row.get("Дата  регистрации и перерегис-трации", "")),
-                            "type": "substance"
-                        }
-                        self.drugs.append(drug)
+                try:
+                    df = pd.read_excel("2. Субстанция .xls", sheet_name=0)
+                    for _, row in df.iterrows():
+                        name = self.safe_str(row.get("Торговое название и <br> синоним", ""))
+                        if name and name != "nan" and len(name) > 3:
+                            drug = {
+                                "name": name,
+                                "international": self.safe_str(row.get("Международное название", "")),
+                                "form": self.safe_str(row.get("Лекарственная форма выпуска", "")),
+                                "country": self.safe_str(row.get("Страна-производитель", "")),
+                                "manufacturer": self.safe_str(row.get("Фирма производитель", "")),
+                                "reg_number": self.safe_str(row.get("№ Регистрационного удостоверения", "")),
+                                "reg_date": self.safe_str(row.get("Дата  регистрации и перерегис-трации", "")),
+                                "type": "substance"
+                            }
+                            self.drugs.append(drug)
+                    logger.info(f"✅ Dorilar: {len(self.drugs)} ta yuklandi")
+                except Exception as e:
+                    logger.error(f"❌ Dorilarni yuklashda xato: {e}")
             
             # 2. In vivo diagnostika
             if os.path.exists("3. Лек.пр.(in vivo).xls"):
-                df = pd.read_excel("3. Лек.пр.(in vivo).xls", sheet_name="ПРОСМОТР")
-                for _, row in df.iterrows():
-                    if pd.notna(row.get("Торговое название")):
-                        drug = {
-                            "name": str(row.get("Торговое название", "")),
-                            "form": str(row.get("Форма выпуска", "")),
-                            "country": str(row.get("Страна-производитель", "")),
-                            "manufacturer": str(row.get("Фирма производитель", "")),
-                            "application": str(row.get("Область применения", "")),
-                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
-                            "reg_date": str(row.get("Дата регистрации и перерегис-трации", "")),
-                            "type": "in_vivo"
-                        }
-                        self.drugs.append(drug)
+                try:
+                    df = pd.read_excel("3. Лек.пр.(in vivo).xls", sheet_name=0)
+                    for _, row in df.iterrows():
+                        name = self.safe_str(row.get("Торговое название", ""))
+                        if name and name != "nan" and len(name) > 3:
+                            drug = {
+                                "name": name,
+                                "form": self.safe_str(row.get("Форма выпуска", "")),
+                                "country": self.safe_str(row.get("Страна-производитель", "")),
+                                "manufacturer": self.safe_str(row.get("Фирма производитель", "")),
+                                "application": self.safe_str(row.get("Область применения", "")),
+                                "reg_number": self.safe_str(row.get("№ Регистрационного удостоверения", "")),
+                                "reg_date": self.safe_str(row.get("Дата регистрации и перерегис-трации", "")),
+                                "type": "in_vivo"
+                            }
+                            self.drugs.append(drug)
+                except Exception as e:
+                    logger.error(f"❌ In vivo ma'lumotlarni yuklashda xato: {e}")
             
-            # 3. Tibbiy texnika va buyumlar
+            # 3. Tibbiy texnika
             if os.path.exists("4. Мед.техника и мед.изд.xls"):
-                df = pd.read_excel("4. Мед.техника и мед.изд.xls", sheet_name="ПРОСМОТР")
-                for _, row in df.iterrows():
-                    if pd.notna(row.get("Tibbiy texnika va tibbiy buyumlarning nomi/Наименование медицинской техники   и изделия медицинского назначения")):
-                        tech = {
-                            "name": str(row.get("Tibbiy texnika va tibbiy buyumlarning nomi/Наименование медицинской техники   и изделия медицинского назначения", "")),
-                            "description": str(row.get("Qo'llanilish sohasi va maxsulot turi/Назначение или краткое описание", "")),
-                            "country": str(row.get("Ishlab chiqaruvchi davlati/Страна-производитель", "")),
-                            "manufacturer": str(row.get("Ishlab chiqaruvchi/Фирма производитель", "")),
-                            "reg_number": str(row.get("Ro'yxatdan o'tkazilganlik raqami/№ Регистрационного удостоверения", "")),
-                            "reg_date": str(row.get("Ro‘yxatdan o'tkazilgan sana/Дата регистрации и перерегистрации", "")),
-                        }
-                        self.tech.append(tech)
+                try:
+                    df = pd.read_excel("4. Мед.техника и мед.изд.xls", sheet_name=0)
+                    for _, row in df.iterrows():
+                        name_col = "Tibbiy texnika va tibbiy buyumlarning nomi/Наименование медицинской техники   и изделия медицинского назначения"
+                        name = self.safe_str(row.get(name_col, ""))
+                        if name and name != "nan" and len(name) > 3:
+                            tech = {
+                                "name": name,
+                                "description": self.safe_str(row.get("Qo'llanilish sohasi va maxsulot turi/Назначение или краткое описание", "")),
+                                "country": self.safe_str(row.get("Ishlab chiqaruvchi davlati/Страна-производитель", "")),
+                                "manufacturer": self.safe_str(row.get("Ishlab chiqaruvchi/Фирма производитель", "")),
+                                "reg_number": self.safe_str(row.get("Ro'yxatdan o'tkazilganlik raqami/№ Регистрационного удостоверения", "")),
+                                "reg_date": self.safe_str(row.get("Ro‘yxatdan o'tkazilgan sana/Дата регистрации и перерегистрации", "")),
+                            }
+                            self.tech.append(tech)
+                    logger.info(f"✅ Tibbiy texnika: {len(self.tech)} ta yuklandi")
+                except Exception as e:
+                    logger.error(f"❌ Tibbiy texnikani yuklashda xato: {e}")
             
             # 4. In vitro diagnostika
             if os.path.exists("5. ИМН для in vitro диаг .xls"):
-                df = pd.read_excel("5. ИМН для in vitro диаг .xls", sheet_name="ПРОСМОТР")
-                for _, row in df.iterrows():
-                    if pd.notna(row.get("Наименование ИМН для in vitro диагностики")):
-                        diag = {
-                            "name": str(row.get("Наименование ИМН для in vitro диагностики", "")),
-                            "form": str(row.get("Форма выпуска", "")),
-                            "country": str(row.get("Страна-производитель", "")),
-                            "manufacturer": str(row.get("Фирма производитель", "")),
-                            "application": str(row.get("Область применения", "")),
-                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
-                            "reg_date": str(row.get("Дата регистрации и перерегис-трации", "")),
-                        }
-                        self.diagnostics.append(diag)
+                try:
+                    df = pd.read_excel("5. ИМН для in vitro диаг .xls", sheet_name=0)
+                    for _, row in df.iterrows():
+                        name = self.safe_str(row.get("Наименование ИМН для in vitro диагностики", ""))
+                        if name and name != "nan" and len(name) > 3:
+                            diag = {
+                                "name": name,
+                                "form": self.safe_str(row.get("Форма выпуска", "")),
+                                "country": self.safe_str(row.get("Страна-производитель", "")),
+                                "manufacturer": self.safe_str(row.get("Фирма производитель", "")),
+                                "application": self.safe_str(row.get("Область применения", "")),
+                                "reg_number": self.safe_str(row.get("№ Регистрационного удостоверения", "")),
+                                "reg_date": self.safe_str(row.get("Дата регистрации и перерегис-трации", "")),
+                            }
+                            self.diagnostics.append(diag)
+                    logger.info(f"✅ Diagnostika: {len(self.diagnostics)} ta yuklandi")
+                except Exception as e:
+                    logger.error(f"❌ Diagnostikani yuklashda xato: {e}")
             
             # 5. Annullangan dorilar
             if os.path.exists("6. Аннул.лек.срва .xls"):
-                df = pd.read_excel("6. Аннул.лек.срва .xls", sheet_name="ПРОСМОТР")
-                for _, row in df.iterrows():
-                    if pd.notna(row.get("Торговое название и <br> синоним")):
-                        annulled = {
-                            "name": str(row.get("Торговое название и <br> синоним", "")),
-                            "international": str(row.get("Международное название", "")),
-                            "form": str(row.get("Лекарственная форма выпуска", "")),
-                            "country": str(row.get("Страна-производитель", "")),
-                            "manufacturer": str(row.get("Фирма производитель", "")),
-                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
-                        }
-                        self.annulled_drugs.append(annulled)
+                try:
+                    df = pd.read_excel("6. Аннул.лек.срва .xls", sheet_name=0)
+                    for _, row in df.iterrows():
+                        name = self.safe_str(row.get("Торговое название и <br> синоним", ""))
+                        if name and name != "nan" and len(name) > 3:
+                            annulled = {
+                                "name": name,
+                                "international": self.safe_str(row.get("Международное название", "")),
+                                "form": self.safe_str(row.get("Лекарственная форма выпуска", "")),
+                                "country": self.safe_str(row.get("Страна-производитель", "")),
+                                "manufacturer": self.safe_str(row.get("Фирма производитель", "")),
+                                "reg_number": self.safe_str(row.get("№ Регистрационного удостоверения", "")),
+                            }
+                            self.annulled_drugs.append(annulled)
+                    logger.info(f"✅ Annullangan: {len(self.annulled_drugs)} ta yuklandi")
+                except Exception as e:
+                    logger.error(f"❌ Annullanganlarni yuklashda xato: {e}")
             
-            logger.info(f"✅ Ma'lumotlar bazasi yuklandi:")
-            logger.info(f"   - Dorilar: {len(self.drugs)} ta")
-            logger.info(f"   - Tibbiy texnika: {len(self.tech)} ta")
-            logger.info(f"   - Diagnostika: {len(self.diagnostics)} ta")
-            logger.info(f"   - Annullangan: {len(self.annulled_drugs)} ta")
+            logger.info("=" * 50)
+            logger.info("📊 MA'LUMOTLAR BAZASI:")
+            logger.info(f"   • Dorilar: {len(self.drugs)} ta")
+            logger.info(f"   • Tibbiy texnika: {len(self.tech)} ta")
+            logger.info(f"   • Diagnostika: {len(self.diagnostics)} ta")
+            logger.info(f"   • Annullangan: {len(self.annulled_drugs)} ta")
+            logger.info("=" * 50)
             
         except Exception as e:
             logger.error(f"❌ Ma'lumotlarni yuklashda xato: {e}")
     
+    def normalize_text(self, text: str) -> str:
+        """Matnni normallashtirish"""
+        if not text:
+            return ""
+        # HTML teglarini olib tashlash
+        text = re.sub(r'<[^>]+>', ' ', str(text))
+        # Ko'p probellarni bitta probelga almashtirish
+        text = re.sub(r'\s+', ' ', text)
+        return text.lower().strip()
+    
     def search_drugs(self, query: str) -> List[Dict]:
         """Dorilarni qidirish"""
-        query = query.lower().strip()
-        results = []
+        query = self.normalize_text(query)
+        if not query or len(query) < 2:
+            return []
         
-        # Barcha dorilarni qidirish
+        results = []
+        query_words = query.split()
+        
         for drug in self.drugs:
-            if (query in drug["name"].lower() or 
-                query in drug.get("international", "").lower() or
-                query in drug.get("manufacturer", "").lower()):
+            name = self.normalize_text(drug["name"])
+            intl = self.normalize_text(drug.get("international", ""))
+            mfr = self.normalize_text(drug.get("manufacturer", ""))
+            
+            # So'zlarni tekshirish
+            match = False
+            for word in query_words:
+                if len(word) < 2:
+                    continue
+                if word in name or word in intl or word in mfr:
+                    match = True
+                    break
+            
+            if match:
                 results.append(drug)
         
         # Annullanganlarni ham tekshirish
         for drug in self.annulled_drugs:
-            if query in drug["name"].lower():
-                drug_copy = drug.copy()
-                drug_copy["annulled"] = True
-                results.append(drug_copy)
+            name = self.normalize_text(drug["name"])
+            for word in query_words:
+                if len(word) > 1 and word in name:
+                    drug_copy = drug.copy()
+                    drug_copy["annulled"] = True
+                    results.append(drug_copy)
+                    break
         
-        return results[:20]  # 20 tadan ko'p bo'lmasin
+        # Unikal qilish
+        unique_results = []
+        seen = set()
+        for drug in results:
+            name = drug.get("name", "")
+            if name not in seen:
+                seen.add(name)
+                unique_results.append(drug)
+        
+        return unique_results[:20]
     
     def search_tech(self, query: str) -> List[Dict]:
         """Tibbiy texnikani qidirish"""
-        query = query.lower().strip()
+        query = self.normalize_text(query)
+        if not query or len(query) < 2:
+            return []
+        
         results = []
+        query_words = query.split()
         
         for item in self.tech:
-            if (query in item["name"].lower() or 
-                query in item.get("description", "").lower() or
-                query in item.get("manufacturer", "").lower()):
-                results.append(item)
+            name = self.normalize_text(item["name"])
+            desc = self.normalize_text(item.get("description", ""))
+            mfr = self.normalize_text(item.get("manufacturer", ""))
+            
+            for word in query_words:
+                if len(word) > 1 and (word in name or word in desc or word in mfr):
+                    results.append(item)
+                    break
         
         return results[:20]
     
     def search_diagnostics(self, query: str) -> List[Dict]:
         """Diagnostika vositalarini qidirish"""
-        query = query.lower().strip()
+        query = self.normalize_text(query)
+        if not query or len(query) < 2:
+            return []
+        
         results = []
+        query_words = query.split()
         
         for item in self.diagnostics:
-            if (query in item["name"].lower() or 
-                query in item.get("application", "").lower() or
-                query in item.get("manufacturer", "").lower()):
-                results.append(item)
+            name = self.normalize_text(item["name"])
+            app = self.normalize_text(item.get("application", ""))
+            mfr = self.normalize_text(item.get("manufacturer", ""))
+            
+            for word in query_words:
+                if len(word) > 1 and (word in name or word in app or word in mfr):
+                    results.append(item)
+                    break
         
         return results[:20]
-    
-    def get_drug_by_reg(self, reg_number: str) -> Optional[Dict]:
-        """Ro'yxatdan o'tkazish raqami bo'yicha dori topish"""
-        for drug in self.drugs:
-            if reg_number in drug.get("reg_number", ""):
-                return drug
-        return None
 
 # Ma'lumotlar bazasini yaratish
 db = MedicineDatabase()
@@ -225,15 +359,23 @@ async def search_openfda(drug_name: str) -> Optional[Dict]:
                         result = data["results"][0]
                         openfda = result.get("openfda", {})
                         
+                        manufacturer = openfda.get("manufacturer_name", [""])[0]
+                        if isinstance(manufacturer, list):
+                            manufacturer = manufacturer[0] if manufacturer else ""
+                        
+                        substance = openfda.get("substance_name", [""])[0]
+                        if isinstance(substance, list):
+                            substance = substance[0] if substance else ""
+                        
                         return {
                             "name": drug_name,
-                            "manufacturer": openfda.get("manufacturer_name", [""])[0],
-                            "substance": openfda.get("substance_name", [""])[0],
+                            "manufacturer": manufacturer,
+                            "substance": substance,
                             "product_type": openfda.get("product_type", [""])[0],
                             "route": openfda.get("route", [""])[0],
-                            "purpose": result.get("purpose", [""])[0],
-                            "indications": result.get("indications_and_usage", [""])[0],
-                            "warnings": result.get("warnings", [""])[0],
+                            "purpose": result.get("purpose", [""])[0] if isinstance(result.get("purpose"), list) else "",
+                            "indications": result.get("indications_and_usage", [""])[0] if isinstance(result.get("indications_and_usage"), list) else "",
+                            "warnings": result.get("warnings", [""])[0] if isinstance(result.get("warnings"), list) else "",
                             "source": "FDA (AQSh)"
                         }
     except Exception as e:
@@ -245,53 +387,75 @@ async def search_openfda(drug_name: str) -> Optional[Dict]:
 # FORMATLASH FUNKSIYALARI
 # ============================================================================
 
+def clean_text(text: str, max_len: int = 100) -> str:
+    """Matnni tozalash va qisqartirish"""
+    if not text or text == "nan":
+        return ""
+    # HTML teglarini olib tashlash
+    text = re.sub(r'<[^>]+>', ' ', str(text))
+    # Ko'p probellarni bitta probelga almashtirish
+    text = re.sub(r'\s+', ' ', text)
+    text = text.strip()
+    if len(text) > max_len:
+        text = text[:max_len] + "..."
+    return text
+
 def format_drug_result(drug: Dict) -> str:
     """Dori ma'lumotini formatlash"""
     lines = []
     
     # Annullanganlik holati
     if drug.get("annulled"):
-        lines.append("❌ *BU DORI ANNULLANGAN!*")
+        lines.append("❌ *❗ BU DORI ANNULLANGAN❗*")
         lines.append("⚠️ Ushbu dori O'zbekistonda ro'yxatdan chiqarilgan!")
         lines.append("")
     
     # Nomi
-    name = drug["name"].split("<br>")[0].strip()
+    name = clean_text(drug["name"], 100)
     lines.append(f"💊 *{name}*")
     lines.append("━" * 32)
     
     # Xalqaro nomi
-    if drug.get("international") and drug["international"] != "nan":
-        lines.append(f"🌍 *Xalqaro nomi:* {drug['international']}")
+    if drug.get("international") and drug["international"] not in ["nan", ""]:
+        intl = clean_text(drug["international"], 100)
+        lines.append(f"🌍 *Xalqaro nomi:* {intl}")
     
     # Shakli
-    if drug.get("form") and drug["form"] != "nan":
-        lines.append(f"📦 *Shakli:* {drug['form']}")
+    if drug.get("form") and drug["form"] not in ["nan", ""]:
+        form = clean_text(drug["form"], 100)
+        lines.append(f"📦 *Shakli:* {form}")
     
     # Ishlab chiqaruvchi
-    if drug.get("manufacturer") and drug["manufacturer"] != "nan":
-        lines.append(f"🏭 *Ishlab chiqaruvchi:* {drug['manufacturer']}")
+    if drug.get("manufacturer") and drug["manufacturer"] not in ["nan", ""]:
+        mfr = clean_text(drug["manufacturer"], 100)
+        lines.append(f"🏭 *Ishlab chiqaruvchi:* {mfr}")
     
     # Mamlakat
-    if drug.get("country") and drug["country"] != "nan":
-        lines.append(f"🌍 *Davlat:* {drug['country']}")
+    if drug.get("country") and drug["country"] not in ["nan", ""]:
+        country = clean_text(drug["country"], 50)
+        lines.append(f"🌍 *Davlat:* {country}")
     
     # Qo'llanilishi
-    if drug.get("application") and drug["application"] != "nan":
-        app = drug["application"][:100]
-        lines.append(f"📋 *Qo'llanilishi:* {app}...")
+    if drug.get("application") and drug["application"] not in ["nan", ""]:
+        app = clean_text(drug["application"], 150)
+        lines.append(f"📋 *Qo'llanilishi:* {app}")
     
     # Ro'yxatdan o'tgan raqam
-    if drug.get("reg_number") and drug["reg_number"] != "nan":
-        lines.append(f"📝 *Ro'yxat raqami:* {drug['reg_number']}")
+    if drug.get("reg_number") and drug["reg_number"] not in ["nan", ""]:
+        reg = clean_text(drug["reg_number"], 50)
+        lines.append(f"📝 *Ro'yxat raqami:* {reg}")
     
     # Ro'yxatdan o'tgan sana
-    if drug.get("reg_date") and drug["reg_date"] != "nan":
-        lines.append(f"📅 *Ro'yxat sanasi:* {drug['reg_date']}")
+    if drug.get("reg_date") and drug["reg_date"] not in ["nan", ""]:
+        date = clean_text(drug["reg_date"], 50)
+        lines.append(f"📅 *Ro'yxat sanasi:* {date}")
     
     lines.append("")
     lines.append("━" * 32)
-    lines.append("✅ Ushbu dori O'zbekistonda ro'yxatdan o'tgan")
+    if not drug.get("annulled"):
+        lines.append("✅ Ushbu dori O'zbekistonda ro'yxatdan o'tgan")
+    else:
+        lines.append("⚠️ Dori ishlatishdan oldin shifokor bilan maslahatlashing!")
     
     return "\n".join(lines)
 
@@ -300,30 +464,34 @@ def format_tech_result(tech: Dict) -> str:
     lines = []
     
     # Nomi
-    name = tech["name"].split("<br>")[0].strip()
+    name = clean_text(tech["name"], 100)
     lines.append(f"⚕️ *{name}*")
     lines.append("━" * 32)
     
     # Tavsif
-    if tech.get("description") and tech["description"] != "nan":
-        desc = tech["description"][:200]
-        lines.append(f"📋 *Tavsif:* {desc}...")
+    if tech.get("description") and tech["description"] not in ["nan", ""]:
+        desc = clean_text(tech["description"], 200)
+        lines.append(f"📋 *Tavsif:* {desc}")
     
     # Ishlab chiqaruvchi
-    if tech.get("manufacturer") and tech["manufacturer"] != "nan":
-        lines.append(f"🏭 *Ishlab chiqaruvchi:* {tech['manufacturer']}")
+    if tech.get("manufacturer") and tech["manufacturer"] not in ["nan", ""]:
+        mfr = clean_text(tech["manufacturer"], 100)
+        lines.append(f"🏭 *Ishlab chiqaruvchi:* {mfr}")
     
     # Mamlakat
-    if tech.get("country") and tech["country"] != "nan":
-        lines.append(f"🌍 *Davlat:* {tech['country']}")
+    if tech.get("country") and tech["country"] not in ["nan", ""]:
+        country = clean_text(tech["country"], 50)
+        lines.append(f"🌍 *Davlat:* {country}")
     
     # Ro'yxat raqami
-    if tech.get("reg_number") and tech["reg_number"] != "nan":
-        lines.append(f"📝 *Ro'yxat raqami:* {tech['reg_number']}")
+    if tech.get("reg_number") and tech["reg_number"] not in ["nan", ""]:
+        reg = clean_text(tech["reg_number"], 50)
+        lines.append(f"📝 *Ro'yxat raqami:* {reg}")
     
     # Ro'yxat sanasi
-    if tech.get("reg_date") and tech["reg_date"] != "nan":
-        lines.append(f"📅 *Ro'yxat sanasi:* {tech['reg_date']}")
+    if tech.get("reg_date") and tech["reg_date"] not in ["nan", ""]:
+        date = clean_text(tech["reg_date"], 50)
+        lines.append(f"📅 *Ro'yxat sanasi:* {date}")
     
     return "\n".join(lines)
 
@@ -332,32 +500,39 @@ def format_diagnostic_result(diag: Dict) -> str:
     lines = []
     
     # Nomi
-    lines.append(f"🔬 *{diag['name']}*")
+    name = clean_text(diag["name"], 100)
+    lines.append(f"🔬 *{name}*")
     lines.append("━" * 32)
     
     # Shakli
-    if diag.get("form") and diag["form"] != "nan":
-        lines.append(f"📦 *Shakli:* {diag['form']}")
+    if diag.get("form") and diag["form"] not in ["nan", ""]:
+        form = clean_text(diag["form"], 100)
+        lines.append(f"📦 *Shakli:* {form}")
     
     # Qo'llanilishi
-    if diag.get("application") and diag["application"] != "nan":
-        lines.append(f"📋 *Qo'llanilishi:* {diag['application']}")
+    if diag.get("application") and diag["application"] not in ["nan", ""]:
+        app = clean_text(diag["application"], 150)
+        lines.append(f"📋 *Qo'llanilishi:* {app}")
     
     # Ishlab chiqaruvchi
-    if diag.get("manufacturer") and diag["manufacturer"] != "nan":
-        lines.append(f"🏭 *Ishlab chiqaruvchi:* {diag['manufacturer']}")
+    if diag.get("manufacturer") and diag["manufacturer"] not in ["nan", ""]:
+        mfr = clean_text(diag["manufacturer"], 100)
+        lines.append(f"🏭 *Ishlab chiqaruvchi:* {mfr}")
     
     # Mamlakat
-    if diag.get("country") and diag["country"] != "nan":
-        lines.append(f"🌍 *Davlat:* {diag['country']}")
+    if diag.get("country") and diag["country"] not in ["nan", ""]:
+        country = clean_text(diag["country"], 50)
+        lines.append(f"🌍 *Davlat:* {country}")
     
     # Ro'yxat raqami
-    if diag.get("reg_number") and diag["reg_number"] != "nan":
-        lines.append(f"📝 *Ro'yxat raqami:* {diag['reg_number']}")
+    if diag.get("reg_number") and diag["reg_number"] not in ["nan", ""]:
+        reg = clean_text(diag["reg_number"], 50)
+        lines.append(f"📝 *Ro'yxat raqami:* {reg}")
     
     # Ro'yxat sanasi
-    if diag.get("reg_date") and diag["reg_date"] != "nan":
-        lines.append(f"📅 *Ro'yxat sanasi:* {diag['reg_date']}")
+    if diag.get("reg_date") and diag["reg_date"] not in ["nan", ""]:
+        date = clean_text(diag["reg_date"], 50)
+        lines.append(f"📅 *Ro'yxat sanasi:* {date}")
     
     return "\n".join(lines)
 
@@ -369,7 +544,7 @@ def format_search_results(results: List[Dict], query: str, result_type: str) -> 
     lines = [f"🔍 '{query}' bo'yicha {len(results)} ta natija:", "━" * 32]
     
     for i, item in enumerate(results[:10], 1):
-        name = item["name"].split("<br>")[0].strip()[:60]
+        name = clean_text(item["name"], 60)
         
         if result_type == "drug":
             if item.get("annulled"):
@@ -385,9 +560,6 @@ def format_search_results(results: List[Dict], query: str, result_type: str) -> 
     
     if len(results) > 10:
         lines.append(f"\n... va yana {len(results)-10} ta natija")
-    
-    lines.append("")
-    lines.append("Batafsil ma'lumot uchun raqamni tanlang")
     
     return "\n".join(lines)
 
@@ -421,12 +593,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "✅ In vitro diagnostika vositalari\n"
         "✅ Annullangan dorilar ro'yxati\n"
         "✅ Xalqaro dorilar (FDA ma'lumotlari)\n\n"
-        "📊 *Ma'lumotlar bazasi:*\n"
-        f"• Dorilar: {len(db.drugs)} ta\n"
-        f"• Tibbiy texnika: {len(db.tech)} ta\n"
-        f"• Diagnostika: {len(db.diagnostics)} ta\n\n"
-        "👇 Kerakli bo'limni tanlang"
     )
+    
+    # Ma'lumotlar bazasi statistikasini qo'shish
+    if len(db.drugs) > 0 or len(db.tech) > 0:
+        welcome_text += "📊 *Ma'lumotlar bazasi:*\n"
+        if len(db.drugs) > 0:
+            welcome_text += f"• Dorilar: {len(db.drugs)} ta\n"
+        if len(db.tech) > 0:
+            welcome_text += f"• Tibbiy texnika: {len(db.tech)} ta\n"
+        if len(db.diagnostics) > 0:
+            welcome_text += f"• Diagnostika: {len(db.diagnostics)} ta\n"
+        if len(db.annulled_drugs) > 0:
+            welcome_text += f"• Annullangan: {len(db.annulled_drugs)} ta\n"
+    else:
+        welcome_text += "⚠️ Ma'lumotlar bazasi yuklanmadi. Excel fayllarni tekshiring.\n"
+    
+    welcome_text += "\n👇 Kerakli bo'limni tanlang"
     
     await update.message.reply_text(
         welcome_text,
@@ -465,10 +648,11 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif text == "📋 Annullangan dorilar":
         if db.annulled_drugs:
             text = "📋 *Annullangan dorilar:*\n\n"
-            for i, drug in enumerate(db.annulled_drugs[:10], 1):
-                name = drug["name"].split("<br>")[0].strip()[:50]
+            for i, drug in enumerate(db.annulled_drugs[:15], 1):
+                name = clean_text(drug["name"], 50)
                 text += f"{i}. ❌ {name}\n"
-            text += f"\n... va yana {len(db.annulled_drugs)-10} ta dori annullangan"
+            if len(db.annulled_drugs) > 15:
+                text += f"\n... va yana {len(db.annulled_drugs)-15} ta dori annullangan"
         else:
             text = "📋 Annullangan dorilar ro'yxati bo'sh"
         
@@ -476,13 +660,14 @@ async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ASOSIY_MENYU
     
     elif text == "🌐 Xalqaro dorilar":
+        context.user_data["search_mode"] = "international"
         await update.message.reply_text(
             "🌐 Xalqaro dori nomini kiriting:\n"
             "Masalan: *Paracetamol*, *Ibuprofen*, *Amoxicillin*\n\n"
             "⚠️ Ma'lumotlar FDA (AQSh) bazasidan olinadi",
             parse_mode=ParseMode.MARKDOWN
         )
-        return DORI_QIDIRISH  # Xuddi shu state, lekin keyin farqlaymiz
+        return DORI_QIDIRISH
     
     elif text == "❓ Yordam":
         help_text = (
@@ -505,7 +690,11 @@ async def handle_drug_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Dori qidiruvini boshqarish"""
     query = update.message.text.strip()
     
-    # Xalqaro dori qidirish (agar /international komandasi bilan kelgan bo'lsa)
+    if len(query) < 2:
+        await update.message.reply_text("❗ Qidiruv so'zi kamida 2 harfdan iborat bo'lishi kerak")
+        return DORI_QIDIRISH
+    
+    # Xalqaro dori qidirish
     if context.user_data.get("search_mode") == "international":
         searching = await update.message.reply_text(
             f"🔍 '{query}' FDA bazasidan qidirilmoqda...\n"
@@ -516,8 +705,30 @@ async def handle_drug_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await searching.delete()
         
         if result:
-            text = format_drug_result(result)
-            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+            # FDA natijasini formatlash
+            lines = []
+            lines.append(f"🌐 *{result['name'].upper()}*")
+            lines.append("━" * 32)
+            
+            if result.get("manufacturer"):
+                lines.append(f"🏭 *Ishlab chiqaruvchi:* {result['manufacturer']}")
+            if result.get("substance"):
+                lines.append(f"🧪 *Modda:* {result['substance']}")
+            if result.get("product_type"):
+                lines.append(f"📦 *Turi:* {result['product_type']}")
+            if result.get("route"):
+                lines.append(f"💊 *Qo'llash:* {result['route']}")
+            if result.get("purpose"):
+                lines.append(f"🎯 *Maqsadi:* {result['purpose']}")
+            if result.get("indications"):
+                lines.append(f"📋 *Qo'llanilishi:* {result['indications'][:200]}")
+            if result.get("source"):
+                lines.append(f"📡 *Manba:* {result['source']}")
+            
+            lines.append("")
+            lines.append("⚠️ Dori ishlatishdan oldin shifokor bilan maslahatlashing!")
+            
+            await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text(
                 f"❌ '{query}' FDA bazasida topilmadi.\n\n"
@@ -545,8 +756,13 @@ async def handle_drug_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             # Tugmalar yaratish
             keyboard = []
             for i, result in enumerate(results[:10], 1):
+                name = clean_text(result["name"], 40)
+                if result.get("annulled"):
+                    btn_text = f"{i}. ❌ {name}"
+                else:
+                    btn_text = f"{i}. 💊 {name}"
                 keyboard.append([InlineKeyboardButton(
-                    f"{i}. {result['name'][:50]}",
+                    btn_text,
                     callback_data=f"drug_select:{i-1}"
                 )])
             
@@ -567,7 +783,8 @@ async def handle_drug_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             "• Nomni to'g'ri yozganingizni tekshiring\n"
             "• Qisqaroq nom bilan qidiring\n"
             "• Lotin alifbosida yozing\n\n"
-            "Yoki '🌐 Xalqaro dorilar' bo'limida qidirib ko'ring"
+            "Yoki '🌐 Xalqaro dorilar' bo'limida qidirib ko'ring",
+            parse_mode=ParseMode.MARKDOWN
         )
     
     return ASOSIY_MENYU
@@ -575,6 +792,10 @@ async def handle_drug_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def handle_tech_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Tibbiy texnika qidiruvi"""
     query = update.message.text.strip()
+    
+    if len(query) < 2:
+        await update.message.reply_text("❗ Qidiruv so'zi kamida 2 harfdan iborat bo'lishi kerak")
+        return TEXNIKA_QIDIRISH
     
     searching = await update.message.reply_text(f"🔍 '{query}' qidirilmoqda...")
     
@@ -590,8 +811,9 @@ async def handle_tech_search(update: Update, context: ContextTypes.DEFAULT_TYPE)
             
             keyboard = []
             for i, result in enumerate(results[:10], 1):
+                name = clean_text(result["name"], 40)
                 keyboard.append([InlineKeyboardButton(
-                    f"{i}. {result['name'][:50]}",
+                    f"{i}. ⚕️ {name}",
                     callback_data=f"tech_select:{i-1}"
                 )])
             
@@ -615,6 +837,10 @@ async def handle_diagnostic_search(update: Update, context: ContextTypes.DEFAULT
     """Diagnostika vositalari qidiruvi"""
     query = update.message.text.strip()
     
+    if len(query) < 2:
+        await update.message.reply_text("❗ Qidiruv so'zi kamida 2 harfdan iborat bo'lishi kerak")
+        return DIAGNOSTIKA_QIDIRISH
+    
     searching = await update.message.reply_text(f"🔍 '{query}' qidirilmoqda...")
     
     results = db.search_diagnostics(query)
@@ -629,8 +855,9 @@ async def handle_diagnostic_search(update: Update, context: ContextTypes.DEFAULT
             
             keyboard = []
             for i, result in enumerate(results[:10], 1):
+                name = clean_text(result["name"], 40)
                 keyboard.append([InlineKeyboardButton(
-                    f"{i}. {result['name'][:50]}",
+                    f"{i}. 🔬 {name}",
                     callback_data=f"diag_select:{i-1}"
                 )])
             
@@ -689,30 +916,40 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     """Asosiy funksiya"""
-    app = Application.builder().token(BOT_TOKEN).build()
-    
-    # Conversation handler
-    conv_handler = ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^(💊 Dori qidirish|⚕️ Tibbiy texnika|🔬 Diagnostika|🌐 Xalqaro dorilar)$"), handle_menu),
-        ],
-        states={
-            DORI_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_drug_search)],
-            TEXNIKA_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tech_search)],
-            DIAGNOSTIKA_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_diagnostic_search)],
-        },
-        fallbacks=[CommandHandler("start", start)],
-        per_message=False,
-    )
-    
-    # Handlerlarni qo'shish
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(conv_handler)
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
-    
-    logger.info("🤖 Dori Bot v4.0 (Rasmiy ma'lumotlar) ishga tushdi!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app = Application.builder().token(BOT_TOKEN).build()
+        
+        # Conversation handler
+        conv_handler = ConversationHandler(
+            entry_points=[
+                MessageHandler(filters.Regex("^(💊 Dori qidirish|⚕️ Tibbiy texnika|🔬 Diagnostika|🌐 Xalqaro dorilar)$"), handle_menu),
+            ],
+            states={
+                DORI_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_drug_search)],
+                TEXNIKA_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tech_search)],
+                DIAGNOSTIKA_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_diagnostic_search)],
+            },
+            fallbacks=[CommandHandler("start", start)],
+            per_message=False,
+        )
+        
+        # Handlerlarni qo'shish
+        app.add_handler(CommandHandler("start", start))
+        app.add_handler(CommandHandler("help", lambda u, c: handle_menu(u, c)))
+        app.add_handler(conv_handler)
+        app.add_handler(CallbackQueryHandler(handle_callback))
+        app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
+        
+        logger.info("=" * 50)
+        logger.info("🤖 Dori Bot v4.0 ishga tushdi!")
+        logger.info(f"📊 Ma'lumotlar: {len(db.drugs)} dori, {len(db.tech)} texnika")
+        logger.info("=" * 50)
+        
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"❌ Bot ishga tushishda xato: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
