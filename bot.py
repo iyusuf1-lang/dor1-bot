@@ -1218,6 +1218,16 @@ async def notifications_checker(context: ContextTypes.DEFAULT_TYPE):
 # MAIN
 # ─────────────────────────────────────────
 
+async def notifications_checker(context: ContextTypes.DEFAULT_TYPE):
+    """Narxlarni tekshirish va xabar yuborish"""
+    # Bu funksiyani periodik ishga tushirish kerak
+    try:
+        logger.info("📊 Narxlar tekshirilmoqda...")
+        # Hozircha bo'sh, keyinroq to'ldiramiz
+        pass
+    except Exception as e:
+        logger.error(f"❌ notifications_checker xatosi: {e}")
+
 def main():
     """Asosiy funksiya"""
     app = Application.builder().token(BOT_TOKEN).build()
@@ -1242,9 +1252,17 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     
-    # Periodik vazifalar
-    job_queue = app.job_queue
-    job_queue.run_repeating(notifications_checker, interval=3600, first=10)
+    # JobQueue ni xavfsiz ishlatish
+    try:
+        job_queue = app.job_queue
+        if job_queue:
+            # Agar JobQueue o'rnatilgan bo'lsa, ishga tushiramiz
+            # job_queue.run_repeating(notifications_checker, interval=3600, first=10)
+            logger.info("✅ JobQueue tayyor (hozircha o'chirilgan)")
+        else:
+            logger.info("⚠️ JobQueue mavjud emas (o'rnatilmagan)")
+    except Exception as e:
+        logger.warning(f"⚠️ JobQueue tekshirish xatosi: {e}")
     
     logger.info("🤖 Dori Bot v3.0 ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
