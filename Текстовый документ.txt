@@ -1,0 +1,7 @@
+# Fayl nomlarini oddiy nomlarga o'zgartirish
+mv "2. Субстанция .xls" "substansiya.xls"
+mv "3. Лек.пр.(in vivo).xls" "invivo.xls"
+mv "4. Мед.техника и мед.изд.xls" "medtexnika.xls"
+mv "5. ИМН для in vitro диаг .xls" "diagnostika.xls"
+mv "6. Аннул.лек.срва .xls" "annullangan.xls"
+mv "7. Аннул.изделия мед.назначения и медтехники.xls" "annul_texnika.xls"
