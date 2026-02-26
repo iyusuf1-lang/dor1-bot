@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Dori Ma'lumot Boti v3.0 - Premium versiya
-To'liq o'zbek tilida, eng yaqin aptekalar, narx kuzatuvi va boshqa imkoniyatlar
+Dori Ma'lumot Boti v4.0 - Rasmiy ma'lumotlar bazasi
+O'zbekiston Respublikasi Sog'liqni Saqlash Vazirligi ma'lumotlari asosida
 """
 
 import asyncio
@@ -10,19 +10,15 @@ import os
 import re
 import json
 import aiohttp
-import hashlib
-import time
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
-from bs4 import BeautifulSoup
+import pandas as pd
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
 from telegram import (
     Update,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InputMediaPhoto,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    Location,
 )
 from telegram.ext import (
     Application,
@@ -35,7 +31,7 @@ from telegram.ext import (
 )
 from telegram.constants import ParseMode
 
-# Logging sozlamalari
+# Logging
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -45,1020 +41,614 @@ logger = logging.getLogger(__name__)
 # Bot token
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 
-# HEADERS
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/122.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "uz-UZ,uz;q=0.9,ru;q=0.8,en;q=0.7",
-}
-
 # Conversation states
-(LOKATSIYA_KUTISH, DORI_NOMI_KUTISH, NARX_KUZATUV) = range(3)
+(ASOSIY_MENYU, DORI_QIDIRISH, TEXNIKA_QIDIRISH, DIAGNOSTIKA_QIDIRISH) = range(4)
 
-# Kesh tizimi
-class Cache:
-    def __init__(self, ttl=3600):  # 1 soat
-        self.cache = {}
-        self.ttl = ttl
-    
-    def get(self, key):
-        if key in self.cache:
-            data, timestamp = self.cache[key]
-            if time.time() - timestamp < self.ttl:
-                return data
-            else:
-                del self.cache[key]
-        return None
-    
-    def set(self, key, value):
-        self.cache[key] = (value, time.time())
-    
-    def clear(self):
-        self.cache.clear()
+# ============================================================================
+# MA'LUMOTLAR BAZASI KLASSI
+# ============================================================================
 
-# Kesh obyektlari
-drug_cache = Cache(ttl=1800)  # 30 daqiqa
-pharmacy_cache = Cache(ttl=86400)  # 1 kun
-
-# Ma'lumotlar bazasi (oddiy fayl)
-class Database:
-    def __init__(self, filename="bot_data.json"):
-        self.filename = filename
-        self.data = self.load()
+class MedicineDatabase:
+    """Dorilar va tibbiy buyumlar ma'lumotlar bazasi"""
     
-    def load(self):
+    def __init__(self):
+        self.drugs = []          # Dorilar ro'yxati
+        self.tech = []           # Tibbiy texnika
+        self.diagnostics = []    # In vitro diagnostika
+        self.annulled_drugs = [] # Annullangan dorilar
+        self.annulled_tech = []  # Annullangan texnika
+        self.load_data()
+    
+    def load_data(self):
+        """Excel fayllardan ma'lumotlarni yuklash"""
         try:
-            with open(self.filename, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except:
-            return {"users": {}, "drug_alerts": {}, "reviews": {}}
+            # 1. Dori vositalari (substansiyalar)
+            if os.path.exists("2. Субстанция .xls"):
+                df = pd.read_excel("2. Субстанция .xls", sheet_name="ПРОСМОТР")
+                for _, row in df.iterrows():
+                    if pd.notna(row.get("Торговое название и <br> синоним")):
+                        drug = {
+                            "name": str(row.get("Торговое название и <br> синоним", "")),
+                            "international": str(row.get("Международное название", "")),
+                            "form": str(row.get("Лекарственная форма выпуска", "")),
+                            "country": str(row.get("Страна-производитель", "")),
+                            "manufacturer": str(row.get("Фирма производитель", "")),
+                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
+                            "reg_date": str(row.get("Дата  регистрации и перерегис-трации", "")),
+                            "type": "substance"
+                        }
+                        self.drugs.append(drug)
+            
+            # 2. In vivo diagnostika
+            if os.path.exists("3. Лек.пр.(in vivo).xls"):
+                df = pd.read_excel("3. Лек.пр.(in vivo).xls", sheet_name="ПРОСМОТР")
+                for _, row in df.iterrows():
+                    if pd.notna(row.get("Торговое название")):
+                        drug = {
+                            "name": str(row.get("Торговое название", "")),
+                            "form": str(row.get("Форма выпуска", "")),
+                            "country": str(row.get("Страна-производитель", "")),
+                            "manufacturer": str(row.get("Фирма производитель", "")),
+                            "application": str(row.get("Область применения", "")),
+                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
+                            "reg_date": str(row.get("Дата регистрации и перерегис-трации", "")),
+                            "type": "in_vivo"
+                        }
+                        self.drugs.append(drug)
+            
+            # 3. Tibbiy texnika va buyumlar
+            if os.path.exists("4. Мед.техника и мед.изд.xls"):
+                df = pd.read_excel("4. Мед.техника и мед.изд.xls", sheet_name="ПРОСМОТР")
+                for _, row in df.iterrows():
+                    if pd.notna(row.get("Tibbiy texnika va tibbiy buyumlarning nomi/Наименование медицинской техники   и изделия медицинского назначения")):
+                        tech = {
+                            "name": str(row.get("Tibbiy texnika va tibbiy buyumlarning nomi/Наименование медицинской техники   и изделия медицинского назначения", "")),
+                            "description": str(row.get("Qo'llanilish sohasi va maxsulot turi/Назначение или краткое описание", "")),
+                            "country": str(row.get("Ishlab chiqaruvchi davlati/Страна-производитель", "")),
+                            "manufacturer": str(row.get("Ishlab chiqaruvchi/Фирма производитель", "")),
+                            "reg_number": str(row.get("Ro'yxatdan o'tkazilganlik raqami/№ Регистрационного удостоверения", "")),
+                            "reg_date": str(row.get("Ro‘yxatdan o'tkazilgan sana/Дата регистрации и перерегистрации", "")),
+                        }
+                        self.tech.append(tech)
+            
+            # 4. In vitro diagnostika
+            if os.path.exists("5. ИМН для in vitro диаг .xls"):
+                df = pd.read_excel("5. ИМН для in vitro диаг .xls", sheet_name="ПРОСМОТР")
+                for _, row in df.iterrows():
+                    if pd.notna(row.get("Наименование ИМН для in vitro диагностики")):
+                        diag = {
+                            "name": str(row.get("Наименование ИМН для in vitro диагностики", "")),
+                            "form": str(row.get("Форма выпуска", "")),
+                            "country": str(row.get("Страна-производитель", "")),
+                            "manufacturer": str(row.get("Фирма производитель", "")),
+                            "application": str(row.get("Область применения", "")),
+                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
+                            "reg_date": str(row.get("Дата регистрации и перерегис-трации", "")),
+                        }
+                        self.diagnostics.append(diag)
+            
+            # 5. Annullangan dorilar
+            if os.path.exists("6. Аннул.лек.срва .xls"):
+                df = pd.read_excel("6. Аннул.лек.срва .xls", sheet_name="ПРОСМОТР")
+                for _, row in df.iterrows():
+                    if pd.notna(row.get("Торговое название и <br> синоним")):
+                        annulled = {
+                            "name": str(row.get("Торговое название и <br> синоним", "")),
+                            "international": str(row.get("Международное название", "")),
+                            "form": str(row.get("Лекарственная форма выпуска", "")),
+                            "country": str(row.get("Страна-производитель", "")),
+                            "manufacturer": str(row.get("Фирма производитель", "")),
+                            "reg_number": str(row.get("№ Регистрационного удостоверения", "")),
+                        }
+                        self.annulled_drugs.append(annulled)
+            
+            logger.info(f"✅ Ma'lumotlar bazasi yuklandi:")
+            logger.info(f"   - Dorilar: {len(self.drugs)} ta")
+            logger.info(f"   - Tibbiy texnika: {len(self.tech)} ta")
+            logger.info(f"   - Diagnostika: {len(self.diagnostics)} ta")
+            logger.info(f"   - Annullangan: {len(self.annulled_drugs)} ta")
+            
+        except Exception as e:
+            logger.error(f"❌ Ma'lumotlarni yuklashda xato: {e}")
     
-    def save(self):
-        with open(self.filename, 'w', encoding='utf-8') as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=2)
-    
-    def add_user(self, user_id, username=None, location=None):
-        if str(user_id) not in self.data["users"]:
-            self.data["users"][str(user_id)] = {
-                "username": username,
-                "first_seen": datetime.now().isoformat(),
-                "last_active": datetime.now().isoformat(),
-                "location": location,
-                "alerts": [],
-                "lang": "uz"
-            }
-        else:
-            self.data["users"][str(user_id)]["last_active"] = datetime.now().isoformat()
-        self.save()
-    
-    def add_alert(self, user_id, drug_name, target_price):
-        alert_id = hashlib.md5(f"{user_id}{drug_name}{time.time()}".encode()).hexdigest()[:8]
-        alert = {
-            "id": alert_id,
-            "user_id": str(user_id),
-            "drug_name": drug_name,
-            "target_price": target_price,
-            "created_at": datetime.now().isoformat(),
-            "last_price": None,
-            "active": True
-        }
+    def search_drugs(self, query: str) -> List[Dict]:
+        """Dorilarni qidirish"""
+        query = query.lower().strip()
+        results = []
         
-        if str(user_id) not in self.data["drug_alerts"]:
-            self.data["drug_alerts"][str(user_id)] = []
+        # Barcha dorilarni qidirish
+        for drug in self.drugs:
+            if (query in drug["name"].lower() or 
+                query in drug.get("international", "").lower() or
+                query in drug.get("manufacturer", "").lower()):
+                results.append(drug)
         
-        self.data["drug_alerts"][str(user_id)].append(alert)
-        self.save()
-        return alert_id
-    
-    def remove_alert(self, user_id, alert_id):
-        if str(user_id) in self.data["drug_alerts"]:
-            self.data["drug_alerts"][str(user_id)] = [
-                a for a in self.data["drug_alerts"][str(user_id)] 
-                if a["id"] != alert_id
-            ]
-            self.save()
-    
-    def get_alerts(self, user_id):
-        return self.data["drug_alerts"].get(str(user_id), [])
-    
-    def add_review(self, drug_name, user_id, rating, comment=""):
-        review_id = hashlib.md5(f"{drug_name}{user_id}{time.time()}".encode()).hexdigest()[:8]
-        review = {
-            "id": review_id,
-            "drug_name": drug_name.lower(),
-            "user_id": str(user_id),
-            "rating": rating,
-            "comment": comment,
-            "created_at": datetime.now().isoformat()
-        }
+        # Annullanganlarni ham tekshirish
+        for drug in self.annulled_drugs:
+            if query in drug["name"].lower():
+                drug_copy = drug.copy()
+                drug_copy["annulled"] = True
+                results.append(drug_copy)
         
-        if drug_name.lower() not in self.data["reviews"]:
-            self.data["reviews"][drug_name.lower()] = []
+        return results[:20]  # 20 tadan ko'p bo'lmasin
+    
+    def search_tech(self, query: str) -> List[Dict]:
+        """Tibbiy texnikani qidirish"""
+        query = query.lower().strip()
+        results = []
         
-        self.data["reviews"][drug_name.lower()].append(review)
-        self.save()
-        return review_id
+        for item in self.tech:
+            if (query in item["name"].lower() or 
+                query in item.get("description", "").lower() or
+                query in item.get("manufacturer", "").lower()):
+                results.append(item)
+        
+        return results[:20]
     
-    def get_reviews(self, drug_name):
-        return self.data["reviews"].get(drug_name.lower(), [])
-
-db = Database()
-
-# ─────────────────────────────────────────
-# APTEKALAR MA'LUMOTLARI
-# ─────────────────────────────────────────
-
-# O'zbekiston aptekalari
-UZBEKISTAN_PHARMACIES = [
-    {
-        "name": "Arzon Apteka",
-        "lat": 41.2995,
-        "lon": 69.2401,
-        "address": "Toshkent, Amir Temur shoh ko'chasi, 15",
-        "phone": "+99871 123-45-67",
-        "working_hours": "09:00 - 21:00",
-        "brand": "arzonapteka"
-    },
-    {
-        "name": "Oxana Apteka",
-        "lat": 41.3115,
-        "lon": 69.2795,
-        "address": "Toshkent, Beruniy shoh ko'chasi, 41",
-        "phone": "+99871 234-56-78",
-        "working_hours": "08:00 - 22:00",
-        "brand": "oxana"
-    },
-    {
-        "name": "Dorixona 24",
-        "lat": 41.3385,
-        "lon": 69.3345,
-        "address": "Toshkent, Chilonzor, 21-mavze",
-        "phone": "+99871 345-67-89",
-        "working_hours": "24/7",
-        "brand": "dorixona24"
-    },
-    {
-        "name": "Sog'lom Avlod",
-        "lat": 41.2825,
-        "lon": 69.2585,
-        "address": "Toshkent, Qatartol ko'chasi, 5",
-        "phone": "+99871 456-78-90",
-        "working_hours": "09:00 - 20:00",
-        "brand": "soglom"
-    },
-    {
-        "name": "Asia Pharm",
-        "lat": 41.3265,
-        "lon": 69.2285,
-        "address": "Toshkent, Shayxontoxur tumani",
-        "phone": "+99871 567-89-01",
-        "working_hours": "09:00 - 21:00",
-        "brand": "asiapharm"
-    },
-]
-
-# Qo'shimcha viloyat aptekalari
-REGION_PHARMACIES = {
-    "samarqand": [
-        {"name": "Samarqand Dorixona", "lat": 39.6275, "lon": 66.9745, "address": "Samarqand, Registon ko'chasi"},
-        {"name": "Abu Ali Ibn Sino", "lat": 39.6545, "lon": 66.9595, "address": "Samarqand, Universitet bulvari"},
-    ],
-    "buxoro": [
-        {"name": "Buxoro Farm", "lat": 39.7745, "lon": 64.4285, "address": "Buxoro, Bahouddin Naqshband ko'chasi"},
-    ],
-    "andijon": [
-        {"name": "Andijon Dorixona", "lat": 40.7825, "lon": 72.3445, "address": "Andijon, Navoiy ko'chasi"},
-    ],
-    "namangan": [
-        {"name": "Namangan Pharm", "lat": 40.9985, "lon": 71.6725, "address": "Namangan, Uychi ko'chasi"},
-    ],
-    "farg'ona": [
-        {"name": "Farg'ona Dorixona", "lat": 40.3845, "lon": 71.7845, "address": "Farg'ona, Mustaqillik ko'chasi"},
-    ],
-    "qashqadaryo": [
-        {"name": "Qarshi Farm", "lat": 38.8605, "lon": 65.7975, "address": "Qarshi, Ko'k Gumbaz ko'chasi"},
-    ],
-    "surxondaryo": [
-        {"name": "Termiz Dorixona", "lat": 37.2245, "lon": 67.2785, "address": "Termiz, At-Termiziy ko'chasi"},
-    ],
-    "xorazm": [
-        {"name": "Urganch Farm", "lat": 41.5845, "lon": 60.6325, "address": "Urganch, Al-Xorazmiy ko'chasi"},
-    ],
-    "jizzax": [
-        {"name": "Jizzax Dorixona", "lat": 40.1155, "lon": 67.8425, "address": "Jizzax, Sharof Rashidov ko'chasi"},
-    ],
-    "sirdaryo": [
-        {"name": "Guliston Farm", "lat": 40.4895, "lon": 68.7875, "address": "Guliston, Mustaqillik ko'chasi"},
-    ],
-    "navoiy": [
-        {"name": "Navoiy Dorixona", "lat": 40.1045, "lon": 65.3585, "address": "Navoiy, Navoiy shoh ko'chasi"},
-    ],
-}
-
-# ─────────────────────────────────────────
-# DORILAR MA'LUMOTLARI (QO'LLANMA)
-# ─────────────────────────────────────────
-
-DRUG_GUIDE = {
-    "paracetamol": {
-        "name": "Paratsetamol",
-        "type": "og'riq qoldiruvchi, isitma tushiruvchi",
-        "dosage": {
-            "kattalar": "500-1000 mg, kuniga 3-4 marta",
-            "bolalar": "10-15 mg/kg, kuniga 4 marta",
-            "maksimal": "Kattalar uchun 4000 mg/kun"
-        },
-        "usage": "Ovqatdan keyin, suv bilan ichiladi",
-        "contraindications": [
-            "Jigar yetishmovchiligi",
-            "Buyrak yetishmovchiligi",
-            "Alkogolizm"
-        ],
-        "side_effects": [
-            "Allergik reaksiyalar",
-            "Ko'ngil aynishi",
-            "Jigar fermentlari oshishi"
-        ],
-        "warning": "Spirtli ichimliklar bilan birga qabul qilmang"
-    },
-    "ibuprofen": {
-        "name": "Ibuprofen",
-        "type": "yallig'lanishga qarshi, og'riq qoldiruvchi",
-        "dosage": {
-            "kattalar": "200-400 mg, kuniga 3-4 marta",
-            "bolalar": "5-10 mg/kg, kuniga 3 marta",
-            "maksimal": "Kattalar uchun 1200 mg/kun"
-        },
-        "usage": "Ovqatdan keyin, suv bilan ichiladi",
-        "contraindications": [
-            "Oshqozon yarasi",
-            "Astma",
-            "Homiladorlik (3-trimestr)"
-        ],
-        "side_effects": [
-            "Oshqozon bezovtaligi",
-            "Ko'ngil aynishi",
-            "Bosh aylanishi"
-        ],
-        "warning": "7 kundan ortiq qabul qilmang"
-    },
-    "amoxicillin": {
-        "name": "Amoksitsillin",
-        "type": "antibiotik",
-        "dosage": {
-            "kattalar": "500 mg, kuniga 3 marta",
-            "bolalar": "20-40 mg/kg/kun",
-            "maksimal": "Kattalar uchun 1500 mg/kun"
-        },
-        "usage": "Ovqatdan oldin yoki keyin",
-        "contraindications": [
-            "Penisillinga allergiya",
-            "Yuqumli mononuklyoz"
-        ],
-        "side_effects": [
-            "Diareya",
-            "Ko'ngil aynishi",
-            "Toshmalar"
-        ],
-        "warning": "Kursni to'liq tugating"
-    },
-    "cetirizin": {
-        "name": "Setirizin",
-        "type": "antigistamin (allergiyaga qarshi)",
-        "dosage": {
-            "kattalar": "10 mg, kuniga 1 marta",
-            "bolalar": "5 mg, kuniga 2 marta",
-            "maksimal": "Kattalar uchun 10 mg/kun"
-        },
-        "usage": "Kechqurun qabul qilish tavsiya etiladi",
-        "contraindications": [
-            "Buyrak yetishmovchiligi",
-            "Homiladorlik"
-        ],
-        "side_effects": [
-            "Uyquchanlik",
-            "Bosh aylanishi",
-            "Quruq og'iz"
-        ],
-        "warning": "Mashina haydashda ehtiyot bo'ling"
-    },
-    "omeprazol": {
-        "name": "Omeprazol",
-        "type": "oshqozon kislotasini kamaytiruvchi",
-        "dosage": {
-            "kattalar": "20 mg, kuniga 1-2 marta",
-            "maksimal": "40 mg/kun"
-        },
-        "usage": "Ovqatdan 30 daqiqa oldin",
-        "contraindications": [
-            "Jigar yetishmovchiligi"
-        ],
-        "side_effects": [
-            "Bosh og'rig'i",
-            "Qorin og'rig'i",
-            "Ko'ngil aynishi"
-        ],
-        "warning": "Uzoq muddat qabul qilmang"
-    }
-}
-
-# Analoglar ma'lumotlar bazasi
-ANALOGS_DB = {
-    "paracetamol": ["Panadol", "Kalpol", "Efferalgan", "Tylenol", "Daleron"],
-    "ibuprofen": ["Nurofen", "Brufen", "Ibuprom", "Advil", "MIG"],
-    "amoxicillin": ["Flemoksin Solutab", "Ospamox", "Amoxil", "Hikontsil"],
-    "cetirizin": ["Zyrtec", "Zodak", "Allertec", "Letizen", "Parlazin"],
-    "loratadin": ["Claritin", "Lorano", "Erolin", "Lomilan", "Clarotadin"],
-    "omeprazol": ["Omez", "Gastrozol", "Ultop", "Losec", "Zerocid"],
-    "drotaverin": ["No-Shpa", "Spazmol", "Spazgan", "Doverin"],
-    "metformin": ["Glucophage", "Siofor", "Metfogamma", "Bagomet"],
-    "azithromycin": ["Sumamed", "Azitro", "Azitral", "Hemomycin"],
-    "fluconazole": ["Diflucan", "Flucostat", "Mikosist", "Futsis"],
-}
-
-# ─────────────────────────────────────────
-# SCRAPING FUNKSIYALARI (OPTIMIZATSIYALANGAN)
-# ─────────────────────────────────────────
-
-async def scrape_arzonapteka(drug_name: str) -> List[Dict]:
-    """ArzonApteka.uz dan dori ma'lumotlarini olish (optimallashtirilgan)"""
-    # Keshdan tekshirish
-    cache_key = f"arzon:{drug_name.lower()}"
-    cached = drug_cache.get(cache_key)
-    if cached:
-        return cached
+    def search_diagnostics(self, query: str) -> List[Dict]:
+        """Diagnostika vositalarini qidirish"""
+        query = query.lower().strip()
+        results = []
+        
+        for item in self.diagnostics:
+            if (query in item["name"].lower() or 
+                query in item.get("application", "").lower() or
+                query in item.get("manufacturer", "").lower()):
+                results.append(item)
+        
+        return results[:20]
     
-    results = []
-    url = f"https://arzonapteka.uz/uz/drug?q={drug_name.replace(' ', '+')}"
-    
+    def get_drug_by_reg(self, reg_number: str) -> Optional[Dict]:
+        """Ro'yxatdan o'tkazish raqami bo'yicha dori topish"""
+        for drug in self.drugs:
+            if reg_number in drug.get("reg_number", ""):
+                return drug
+        return None
+
+# Ma'lumotlar bazasini yaratish
+db = MedicineDatabase()
+
+# ============================================================================
+# OPENFDA API INTEGRATSIYASI (Xalqaro dorilar uchun)
+# ============================================================================
+
+async def search_openfda(drug_name: str) -> Optional[Dict]:
+    """OpenFDA API orqali xalqaro dorilarni qidirish"""
     try:
+        url = f"https://api.fda.gov/drug/label.json?search=openfda.brand_name:{drug_name}&limit=1"
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    return []
-                html = await resp.text()
-        
-        soup = BeautifulSoup(html, "html.parser")
-        
-        # Mahsulotlarni topish
-        cards = soup.select(".drug-card, .product-card, [class*='drug']")
-        if not cards:
-            cards = soup.find_all("div", class_=re.compile(r"card|item|product", re.I))
-        
-        for card in cards[:10]:  # 10 tagacha
-            item = {}
-            
-            # Nom
-            name_el = card.select_one("h3, h4, .name, .title")
-            if name_el:
-                item["name"] = name_el.get_text(strip=True)[:100]
-            else:
-                continue
-            
-            # Narx
-            price_el = card.select_one(".price, .cost, [class*='price']")
-            if price_el:
-                price_text = price_el.get_text(strip=True)
-                numbers = re.findall(r"\d[\d\s]*\d", price_text)
-                if numbers:
-                    try:
-                        price_str = re.sub(r"\s+", "", numbers[0])
-                        item["price"] = int(price_str)
-                    except:
-                        pass
-            
-            # Rasm
-            img = card.select_one("img")
-            if img:
-                src = img.get("src") or img.get("data-src", "")
-                if src and src.startswith("/"):
-                    src = "https://arzonapteka.uz" + src
-                if src.startswith("http"):
-                    item["image"] = src
-            
-            # Ishlab chiqaruvchi
-            mfr = card.select_one(".manufacturer, .brand")
-            if mfr:
-                item["manufacturer"] = mfr.get_text(strip=True)[:60]
-            
-            item["source"] = "Arzon Apteka"
-            results.append(item)
-        
-        # Keshga saqlash
-        if results:
-            drug_cache.set(cache_key, results)
-    
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("results"):
+                        result = data["results"][0]
+                        openfda = result.get("openfda", {})
+                        
+                        return {
+                            "name": drug_name,
+                            "manufacturer": openfda.get("manufacturer_name", [""])[0],
+                            "substance": openfda.get("substance_name", [""])[0],
+                            "product_type": openfda.get("product_type", [""])[0],
+                            "route": openfda.get("route", [""])[0],
+                            "purpose": result.get("purpose", [""])[0],
+                            "indications": result.get("indications_and_usage", [""])[0],
+                            "warnings": result.get("warnings", [""])[0],
+                            "source": "FDA (AQSh)"
+                        }
     except Exception as e:
-        logger.warning(f"ArzonApteka xatosi: {e}")
+        logger.warning(f"OpenFDA xatosi: {e}")
     
-    return results
+    return None
 
-async def scrape_oxana(drug_name: str) -> List[Dict]:
-    """Oxana.uz dan ma'lumot olish"""
-    cache_key = f"oxana:{drug_name.lower()}"
-    cached = drug_cache.get(cache_key)
-    if cached:
-        return cached
-    
-    results = []
-    try:
-        # Oxana API yoki veb-sayt
-        # Hozircha demo ma'lumot
-        demo_prices = {
-            "paracetamol": 5000,
-            "ibuprofen": 8000,
-            "amoxicillin": 15000,
-            "cetirizin": 12000,
-        }
-        
-        drug_lower = drug_name.lower()
-        if drug_lower in demo_prices:
-            results.append({
-                "name": drug_name.title(),
-                "price": demo_prices[drug_lower],
-                "source": "Oxana Apteka",
-                "manufacturer": "Turli ishlab chiqaruvchilar"
-            })
-        
-        drug_cache.set(cache_key, results)
-    except Exception as e:
-        logger.warning(f"Oxana xatosi: {e}")
-    
-    return results
+# ============================================================================
+# FORMATLASH FUNKSIYALARI
+# ============================================================================
 
-# ─────────────────────────────────────────
-# GEOFUNKSIYALAR
-# ─────────────────────────────────────────
-
-def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    """Haversine formulasi orqali masofani hisoblash (km)"""
-    from math import radians, sin, cos, sqrt, atan2
-    
-    R = 6371  # Yer radiusi (km)
-    
-    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1-a))
-    
-    return R * c
-
-def find_nearby_pharmacies(lat: float, lon: float, radius: float = 5.0) -> List[Dict]:
-    """Berilgan lokatsiya atrofidagi aptekalarni topish"""
-    nearby = []
-    
-    # Asosiy aptekalar
-    for pharmacy in UZBEKISTAN_PHARMACIES:
-        distance = calculate_distance(lat, lon, pharmacy["lat"], pharmacy["lon"])
-        if distance <= radius:
-            pharmacy_copy = pharmacy.copy()
-            pharmacy_copy["distance"] = round(distance, 2)
-            nearby.append(pharmacy_copy)
-    
-    # Viloyat aptekalari (agar radius katta bo'lsa)
-    if radius > 10:
-        for region, pharmacies in REGION_PHARMACIES.items():
-            for pharmacy in pharmacies:
-                distance = calculate_distance(lat, lon, pharmacy["lat"], pharmacy["lon"])
-                if distance <= radius:
-                    pharmacy_copy = pharmacy.copy()
-                    pharmacy_copy["distance"] = round(distance, 2)
-                    pharmacy_copy["region"] = region
-                    nearby.append(pharmacy_copy)
-    
-    # Masofa bo'yicha saralash
-    nearby.sort(key=lambda x: x["distance"])
-    
-    return nearby[:10]  # Eng yaqin 10 tasi
-
-# ─────────────────────────────────────────
-# DORI MA'LUMOTLARINI YIG'ISH
-# ─────────────────────────────────────────
-
-async def fetch_drug_full_data(drug_name: str) -> Dict:
-    """Barcha manbalardan ma'lumot yig'ish (optimallashtirilgan)"""
-    # Keshdan tekshirish
-    cache_key = f"drug:{drug_name.lower()}"
-    cached = drug_cache.get(cache_key)
-    if cached:
-        return cached
-    
-    data = {
-        "name": drug_name,
-        "found": False,
-        "price_min": None,
-        "price_max": None,
-        "average_price": None,
-        "pharmacies": [],          # Aptekalar ro'yxati
-        "manufacturer": None,
-        "description": None,
-        "image_url": None,
-        "guide": None,
-        "source": None,
-        "rating": None,
-    }
-    
-    # Parallel qidirish
-    tasks = [
-        scrape_arzonapteka(drug_name),
-        scrape_oxana(drug_name),
-    ]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    all_items = []
-    pharmacy_prices = []
-    
-    for r in results:
-        if isinstance(r, list):
-            all_items.extend(r)
-    
-    if all_items:
-        data["found"] = True
-        
-        # Narxlar va aptekalar
-        prices = []
-        for item in all_items:
-            if item.get("price"):
-                prices.append(item["price"])
-                pharmacy_prices.append({
-                    "name": item.get("source", "Apteka"),
-                    "price": item["price"],
-                    "manufacturer": item.get("manufacturer")
-                })
-        
-        if prices:
-            data["price_min"] = min(prices)
-            data["price_max"] = max(prices)
-            data["average_price"] = sum(prices) // len(prices)
-            data["pharmacies"] = pharmacy_prices
-        
-        # Birinchi elementdan ma'lumotlar
-        first = all_items[0]
-        data["name"] = first.get("name", drug_name)
-        data["manufacturer"] = first.get("manufacturer")
-        data["image_url"] = first.get("image")
-        data["source"] = first.get("source")
-    
-    # Dori qo'llanmasi
-    drug_key = drug_name.lower().replace("-", "").replace(" ", "")
-    for key, guide in DRUG_GUIDE.items():
-        if key in drug_key or drug_key in key:
-            data["guide"] = guide
-            data["description"] = guide.get("type", "")
-            break
-    
-    # Reyting
-    reviews = db.get_reviews(drug_name)
-    if reviews:
-        avg_rating = sum(r["rating"] for r in reviews) / len(reviews)
-        data["rating"] = round(avg_rating, 1)
-    
-    # Keshga saqlash
-    drug_cache.set(cache_key, data)
-    
-    return data
-
-# ─────────────────────────────────────────
-# XABAR FORMATLASH (CHIROYLI DIZAYN)
-# ─────────────────────────────────────────
-
-def format_drug_result(data: Dict) -> str:
-    """Dori ma'lumotini chiroyli formatlash"""
+def format_drug_result(drug: Dict) -> str:
+    """Dori ma'lumotini formatlash"""
     lines = []
     
-    # Sarlavha
-    name = data["name"].upper()
+    # Annullanganlik holati
+    if drug.get("annulled"):
+        lines.append("❌ *BU DORI ANNULLANGAN!*")
+        lines.append("⚠️ Ushbu dori O'zbekistonda ro'yxatdan chiqarilgan!")
+        lines.append("")
+    
+    # Nomi
+    name = drug["name"].split("<br>")[0].strip()
     lines.append(f"💊 *{name}*")
     lines.append("━" * 32)
     
-    # Narx
-    if data["price_min"]:
-        price_min = f"{data['price_min']:,}".replace(",", " ")
-        if data["price_max"] and data["price_max"] != data["price_min"]:
-            price_max = f"{data['price_max']:,}".replace(",", " ")
-            lines.append(f"💰 *Narx:* {price_min} – {price_max} so'm")
-        else:
-            lines.append(f"💰 *Narx:* {price_min} so'm")
-        
-        if data.get("average_price"):
-            avg = f"{data['average_price']:,}".replace(",", " ")
-            lines.append(f"📊 *O'rtacha:* {avg} so'm")
-    else:
-        lines.append("💰 *Narx:* —")
+    # Xalqaro nomi
+    if drug.get("international") and drug["international"] != "nan":
+        lines.append(f"🌍 *Xalqaro nomi:* {drug['international']}")
     
-    # Reyting
-    if data.get("rating"):
-        stars = "⭐" * int(data["rating"])
-        lines.append(f"{stars} ({data['rating']}/5)")
-    
-    lines.append("")
-    
-    # Aptekalar
-    if data.get("pharmacies"):
-        lines.append("🏪 *Aptekalar:*")
-        for i, ph in enumerate(data["pharmacies"][:5], 1):
-            price = f"{ph['price']:,}".replace(",", " ")
-            lines.append(f"  {i}. {ph['name']}: {price} so'm")
-        if len(data["pharmacies"]) > 5:
-            lines.append(f"  ... va yana {len(data['pharmacies'])-5} ta")
-    
-    lines.append("")
-    
-    # Dori qo'llanmasi
-    if data.get("guide"):
-        guide = data["guide"]
-        lines.append(f"📋 *Turi:* {guide['type']}")
-        
-        # Dozalar
-        lines.append("💊 *Dozalari:*")
-        for kim, doza in guide['dosage'].items():
-            lines.append(f"  • {kim.title()}: {doza}")
-        
-        # Qo'llash
-        lines.append(f"💧 *Qo'llash:* {guide['usage']}")
-        
-        # Qarshi ko'rsatmalar
-        if guide.get('contraindications'):
-            lines.append("⚠️ *Qarshi ko'rsatmalar:*")
-            for item in guide['contraindications'][:3]:
-                lines.append(f"  • {item}")
-        
-        # Ogohlantirish
-        if guide.get('warning'):
-            lines.append(f"\n🔔 *Ogohlantirish:* {guide['warning']}")
+    # Shakli
+    if drug.get("form") and drug["form"] != "nan":
+        lines.append(f"📦 *Shakli:* {drug['form']}")
     
     # Ishlab chiqaruvchi
-    if data.get("manufacturer"):
-        lines.append(f"\n🏭 *Ishlab chiqaruvchi:* {data['manufacturer']}")
+    if drug.get("manufacturer") and drug["manufacturer"] != "nan":
+        lines.append(f"🏭 *Ishlab chiqaruvchi:* {drug['manufacturer']}")
     
-    # Manba
-    if data.get("source"):
-        lines.append(f"📡 *Manba:* {data['source']}")
+    # Mamlakat
+    if drug.get("country") and drug["country"] != "nan":
+        lines.append(f"🌍 *Davlat:* {drug['country']}")
+    
+    # Qo'llanilishi
+    if drug.get("application") and drug["application"] != "nan":
+        app = drug["application"][:100]
+        lines.append(f"📋 *Qo'llanilishi:* {app}...")
+    
+    # Ro'yxatdan o'tgan raqam
+    if drug.get("reg_number") and drug["reg_number"] != "nan":
+        lines.append(f"📝 *Ro'yxat raqami:* {drug['reg_number']}")
+    
+    # Ro'yxatdan o'tgan sana
+    if drug.get("reg_date") and drug["reg_date"] != "nan":
+        lines.append(f"📅 *Ro'yxat sanasi:* {drug['reg_date']}")
     
     lines.append("")
     lines.append("━" * 32)
-    lines.append("⚠️ _Dori ishlatishdan oldin shifokor bilan maslahatlashing!_")
+    lines.append("✅ Ushbu dori O'zbekistonda ro'yxatdan o'tgan")
     
     return "\n".join(lines)
 
-def format_nearby_pharmacies(pharmacies: List[Dict], drug_name: str = None) -> str:
-    """Yaqin aptekalarni formatlash"""
+def format_tech_result(tech: Dict) -> str:
+    """Tibbiy texnika ma'lumotini formatlash"""
     lines = []
     
-    if drug_name:
-        lines.append(f"📍 *{drug_name.upper()}* yaqin aptekalarda:")
-    else:
-        lines.append("📍 *Sizga yaqin aptekalar:*")
-    
+    # Nomi
+    name = tech["name"].split("<br>")[0].strip()
+    lines.append(f"⚕️ *{name}*")
     lines.append("━" * 32)
     
-    for i, ph in enumerate(pharmacies[:10], 1):
-        lines.append(f"\n{i}. *{ph['name']}*")
-        lines.append(f"   📍 {ph['address']}")
-        lines.append(f"   📞 {ph['phone']}")
-        lines.append(f"   🕒 {ph['working_hours']}")
-        lines.append(f"   📏 {ph['distance']} km")
+    # Tavsif
+    if tech.get("description") and tech["description"] != "nan":
+        desc = tech["description"][:200]
+        lines.append(f"📋 *Tavsif:* {desc}...")
+    
+    # Ishlab chiqaruvchi
+    if tech.get("manufacturer") and tech["manufacturer"] != "nan":
+        lines.append(f"🏭 *Ishlab chiqaruvchi:* {tech['manufacturer']}")
+    
+    # Mamlakat
+    if tech.get("country") and tech["country"] != "nan":
+        lines.append(f"🌍 *Davlat:* {tech['country']}")
+    
+    # Ro'yxat raqami
+    if tech.get("reg_number") and tech["reg_number"] != "nan":
+        lines.append(f"📝 *Ro'yxat raqami:* {tech['reg_number']}")
+    
+    # Ro'yxat sanasi
+    if tech.get("reg_date") and tech["reg_date"] != "nan":
+        lines.append(f"📅 *Ro'yxat sanasi:* {tech['reg_date']}")
+    
+    return "\n".join(lines)
+
+def format_diagnostic_result(diag: Dict) -> str:
+    """Diagnostika vositasi ma'lumotini formatlash"""
+    lines = []
+    
+    # Nomi
+    lines.append(f"🔬 *{diag['name']}*")
+    lines.append("━" * 32)
+    
+    # Shakli
+    if diag.get("form") and diag["form"] != "nan":
+        lines.append(f"📦 *Shakli:* {diag['form']}")
+    
+    # Qo'llanilishi
+    if diag.get("application") and diag["application"] != "nan":
+        lines.append(f"📋 *Qo'llanilishi:* {diag['application']}")
+    
+    # Ishlab chiqaruvchi
+    if diag.get("manufacturer") and diag["manufacturer"] != "nan":
+        lines.append(f"🏭 *Ishlab chiqaruvchi:* {diag['manufacturer']}")
+    
+    # Mamlakat
+    if diag.get("country") and diag["country"] != "nan":
+        lines.append(f"🌍 *Davlat:* {diag['country']}")
+    
+    # Ro'yxat raqami
+    if diag.get("reg_number") and diag["reg_number"] != "nan":
+        lines.append(f"📝 *Ro'yxat raqami:* {diag['reg_number']}")
+    
+    # Ro'yxat sanasi
+    if diag.get("reg_date") and diag["reg_date"] != "nan":
+        lines.append(f"📅 *Ro'yxat sanasi:* {diag['reg_date']}")
+    
+    return "\n".join(lines)
+
+def format_search_results(results: List[Dict], query: str, result_type: str) -> str:
+    """Qidiruv natijalarini formatlash"""
+    if not results:
+        return f"❌ '{query}' bo'yicha hech narsa topilmadi."
+    
+    lines = [f"🔍 '{query}' bo'yicha {len(results)} ta natija:", "━" * 32]
+    
+    for i, item in enumerate(results[:10], 1):
+        name = item["name"].split("<br>")[0].strip()[:60]
         
-        if drug_name and ph.get("price"):
-            price = f"{ph['price']:,}".replace(",", " ")
-            lines.append(f"   💰 {price} so'm")
+        if result_type == "drug":
+            if item.get("annulled"):
+                lines.append(f"{i}. ❌ {name} (ANNULLANGAN)")
+            else:
+                lines.append(f"{i}. 💊 {name}")
+        
+        elif result_type == "tech":
+            lines.append(f"{i}. ⚕️ {name}")
+        
+        elif result_type == "diagnostic":
+            lines.append(f"{i}. 🔬 {name}")
     
-    return "\n".join(lines)
-
-def format_alerts(user_alerts: List[Dict]) -> str:
-    """Narx kuzatuvi ro'yxatini formatlash"""
-    if not user_alerts:
-        return "📭 Sizda faol kuzatuvlar yo'q"
+    if len(results) > 10:
+        lines.append(f"\n... va yana {len(results)-10} ta natija")
     
-    lines = ["📊 *Faol kuzatuvlaringiz:*", "━" * 32]
-    
-    for alert in user_alerts:
-        if alert["active"]:
-            target = f"{alert['target_price']:,}".replace(",", " ")
-            lines.append(f"\n💊 *{alert['drug_name']}*")
-            lines.append(f"   🎯 Maqsad: {target} so'm")
-            if alert.get("last_price"):
-                last = f"{alert['last_price']:,}".replace(",", " ")
-                lines.append(f"   💰 Oxirgi: {last} so'm")
-            lines.append(f"   🆔 ID: `{alert['id']}`")
-    
-    return "\n".join(lines)
-
-def format_reviews(drug_name: str, reviews: List[Dict]) -> str:
-    """Sharhlarni formatlash"""
-    if not reviews:
-        return f"💭 *{drug_name}* uchun hali sharhlar yo'q\n\nBirinchi bo'lib fikr bildiring!"
-    
-    lines = [f"💭 *{drug_name}* sharhlari:", "━" * 32]
-    
-    # O'rtacha reyting
-    avg_rating = sum(r["rating"] for r in reviews) / len(reviews)
-    stars = "⭐" * int(avg_rating)
-    lines.append(f"\n{stars} {avg_rating:.1f}/5 ({len(reviews)} ta sharh)")
     lines.append("")
-    
-    for i, review in enumerate(reviews[-5:], 1):  # Oxirgi 5 ta
-        stars = "⭐" * review["rating"]
-        lines.append(f"\n{i}. {stars}")
-        if review.get("comment"):
-            lines.append(f"   💬 _{review['comment'][:100]}_")
-        date = review["created_at"][:10]
-        lines.append(f"   📅 {date}")
+    lines.append("Batafsil ma'lumot uchun raqamni tanlang")
     
     return "\n".join(lines)
 
-# ─────────────────────────────────────────
+# ============================================================================
 # KLAVIATURALAR
-# ─────────────────────────────────────────
+# ============================================================================
 
-def main_menu_keyboard() -> ReplyKeyboardMarkup:
+def main_keyboard() -> ReplyKeyboardMarkup:
     """Asosiy menyu"""
     keyboard = [
-        [KeyboardButton("💊 Dori qidirish"), KeyboardButton("📍 Yaqin aptekalar")],
-        [KeyboardButton("📊 Narx kuzatuvi"), KeyboardButton("⭐ Mashhur dorilar")],
-        [KeyboardButton("📋 Yordam"), KeyboardButton("⚙️ Sozlamalar")]
+        [KeyboardButton("💊 Dori qidirish"), KeyboardButton("⚕️ Tibbiy texnika")],
+        [KeyboardButton("🔬 Diagnostika"), KeyboardButton("📋 Annullangan dorilar")],
+        [KeyboardButton("🌐 Xalqaro dorilar"), KeyboardButton("❓ Yordam")]
     ]
     return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-def location_keyboard() -> ReplyKeyboardMarkup:
-    """Lokatsiya yuborish tugmasi"""
-    keyboard = [
-        [KeyboardButton("📍 Lokatsiyani yuborish", request_location=True)],
-        [KeyboardButton("🏠 Asosiy menyu")]
-    ]
-    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
-
-def drug_action_keyboard(drug_name: str, has_location: bool = False) -> InlineKeyboardMarkup:
-    """Dori uchun tugmalar"""
-    rows = [
-        [
-            InlineKeyboardButton("📍 Yaqin aptekalar", callback_data=f"nearby:{drug_name[:30]}"),
-            InlineKeyboardButton("💊 Analoglar", callback_data=f"analogs:{drug_name[:30]}"),
-        ],
-        [
-            InlineKeyboardButton("📊 Narx kuzatuvi", callback_data=f"alert:{drug_name[:30]}"),
-            InlineKeyboardButton("⭐ Baholash", callback_data=f"rate:{drug_name[:30]}"),
-        ],
-        [
-            InlineKeyboardButton("🔄 Yangi qidiruv", callback_data="new_search"),
-        ]
-    ]
-    
-    return InlineKeyboardMarkup(rows)
-
-def rating_keyboard(drug_name: str) -> InlineKeyboardMarkup:
-    """Baholash tugmalari"""
-    rows = []
-    ratings = []
-    for i in range(1, 6):
-        ratings.append(InlineKeyboardButton(f"{i}⭐", callback_data=f"rate:{drug_name}:{i}"))
-    
-    # 3 ta qatorga bo'lish
-    rows.append(ratings[:3])
-    rows.append(ratings[3:])
-    rows.append([InlineKeyboardButton("◀️ Orqaga", callback_data=f"back:{drug_name}")])
-    
-    return InlineKeyboardMarkup(rows)
-
-def alert_price_keyboard(drug_name: str) -> InlineKeyboardMarkup:
-    """Narx kuzatuvi uchun narx variantlari"""
-    rows = [
-        [
-            InlineKeyboardButton("10 000 so'm", callback_data=f"setalert:{drug_name}:10000"),
-            InlineKeyboardButton("20 000 so'm", callback_data=f"setalert:{drug_name}:20000"),
-        ],
-        [
-            InlineKeyboardButton("30 000 so'm", callback_data=f"setalert:{drug_name}:30000"),
-            InlineKeyboardButton("50 000 so'm", callback_data=f"setalert:{drug_name}:50000"),
-        ],
-        [
-            InlineKeyboardButton("Boshqa narx", callback_data=f"customalert:{drug_name}"),
-            InlineKeyboardButton("◀️ Orqaga", callback_data=f"back:{drug_name}"),
-        ],
-    ]
-    return InlineKeyboardMarkup(rows)
-
-# ─────────────────────────────────────────
+# ============================================================================
 # HANDLERLAR
-# ─────────────────────────────────────────
+# ============================================================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Start komandasi"""
     user = update.effective_user
-    db.add_user(user.id, user.username)
     
     welcome_text = (
         f"👋 Assalomu alaykum, *{user.first_name}*!\n\n"
-        "💊 *Dori Ma'lumot Boti v3.0* ga xush kelibsiz!\n\n"
-        "📌 *Men yordam bera olaman:*\n"
-        "• Dori narxlari va aptekalarni topish\n"
-        "• Eng yaqin aptekalarni ko'rsatish\n"
-        "• Dori qo'llanmasi va dozalari\n"
-        "• Narx o'zgarganda xabar berish\n"
-        "• Boshqa foydalanuvchilar sharhlari\n\n"
-        "👇 Quyidagi tugmalardan foydalaning"
+        "🔰 *Dori Ma'lumot Boti v4.0* - Rasmiy ma'lumotlar bazasi\n\n"
+        "📌 *Imkoniyatlar:*\n"
+        "✅ O'zbekistonda ro'yxatdan o'tgan dorilar\n"
+        "✅ Tibbiy texnika va asbob-uskunalar\n"
+        "✅ In vitro diagnostika vositalari\n"
+        "✅ Annullangan dorilar ro'yxati\n"
+        "✅ Xalqaro dorilar (FDA ma'lumotlari)\n\n"
+        "📊 *Ma'lumotlar bazasi:*\n"
+        f"• Dorilar: {len(db.drugs)} ta\n"
+        f"• Tibbiy texnika: {len(db.tech)} ta\n"
+        f"• Diagnostika: {len(db.diagnostics)} ta\n\n"
+        "👇 Kerakli bo'limni tanlang"
     )
     
     await update.message.reply_text(
         welcome_text,
-        reply_markup=main_menu_keyboard(),
+        reply_markup=main_keyboard(),
         parse_mode=ParseMode.MARKDOWN
     )
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Yordam komandasi"""
-    help_text = (
-        "📋 *Yordam va qo'llanma*\n\n"
-        "*💊 Dori qidirish:*\n"
-        "Dori nomini yozing (masalan: Paratsetamol)\n\n"
-        "*📍 Yaqin aptekalar:*\n"
-        "Lokatsiyangizni yuboring, eng yaqin aptekalarni ko'rsataman\n\n"
-        "*📊 Narx kuzatuvi:*\n"
-        "Dorilar narxi kutilgan narxdan pastga tushganda xabar beraman\n\n"
-        "*⭐ Mashhur dorilar:*\n"
-        "Eng ko'p qidirilgan dorilar ro'yxati\n\n"
-        "*⚙️ Sozlamalar:*\n"
-        "Til, bildirishnomalar va boshqa sozlamalar\n\n"
-        "📞 *Aloqa:* @admin"
-    )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
 
 async def handle_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Menyu tugmalarini boshqarish"""
     text = update.message.text
-    user = update.effective_user
     
     if text == "💊 Dori qidirish":
         await update.message.reply_text(
-            "🔍 Qidirmoqchi bo'lgan dori nomini yozing:"
-        )
-        return DORI_NOMI_KUTISH
-    
-    elif text == "📍 Yaqin aptekalar":
-        await update.message.reply_text(
-            "📍 Iltimos, lokatsiyangizni yuboring.\n"
-            "Men sizga eng yaqin aptekalarni ko'rsataman.",
-            reply_markup=location_keyboard()
-        )
-        return LOKATSIYA_KUTISH
-    
-    elif text == "📊 Narx kuzatuvi":
-        alerts = db.get_alerts(user.id)
-        text = format_alerts(alerts)
-        
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("➕ Yangi kuzatuv", callback_data="new_alert"),
-            InlineKeyboardButton("❌ O'chirish", callback_data="remove_alert")
-        ]])
-        
-        await update.message.reply_text(
-            text,
-            reply_markup=keyboard,
+            "💊 Qidirmoqchi bo'lgan dori nomini kiriting:\n"
+            "Masalan: *Paratsetamol*, *Amoksitsillin*, *Ibuprofen*",
             parse_mode=ParseMode.MARKDOWN
         )
+        return DORI_QIDIRISH
     
-    elif text == "⭐ Mashhur dorilar":
-        popular = [
-            "Paratsetamol", "Ibuprofen", "Amoksitsillin",
-            "Setirizin", "Omeprazol", "No-Shpa"
-        ]
-        
-        text = "⭐ *Eng ko'p qidirilgan dorilar:*\n\n"
-        for i, drug in enumerate(popular, 1):
-            text += f"{i}. {drug}\n"
+    elif text == "⚕️ Tibbiy texnika":
+        await update.message.reply_text(
+            "⚕️ Qidirmoqchi bo'lgan tibbiy asbob-uskuna nomini kiriting:\n"
+            "Masalan: *Tomograf*, *Ultratovush*, *Stomatologik kreslo*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return TEXNIKA_QIDIRISH
+    
+    elif text == "🔬 Diagnostika":
+        await update.message.reply_text(
+            "🔬 Qidirmoqchi bo'lgan diagnostika vositasini kiriting:\n"
+            "Masalan: *VICH test*, *Glyukometr*, *Reagent*",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return DIAGNOSTIKA_QIDIRISH
+    
+    elif text == "📋 Annullangan dorilar":
+        if db.annulled_drugs:
+            text = "📋 *Annullangan dorilar:*\n\n"
+            for i, drug in enumerate(db.annulled_drugs[:10], 1):
+                name = drug["name"].split("<br>")[0].strip()[:50]
+                text += f"{i}. ❌ {name}\n"
+            text += f"\n... va yana {len(db.annulled_drugs)-10} ta dori annullangan"
+        else:
+            text = "📋 Annullangan dorilar ro'yxati bo'sh"
         
         await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        return ASOSIY_MENYU
     
-    elif text == "📋 Yordam":
-        await help_command(update, context)
-    
-    elif text == "⚙️ Sozlamalar":
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("🇺🇿 O'zbek tili", callback_data="lang:uz")],
-            [InlineKeyboardButton("🇷🇺 Русский язык", callback_data="lang:ru")],
-            [InlineKeyboardButton("🔔 Bildirishnomalar", callback_data="notifications")],
-        ])
-        
+    elif text == "🌐 Xalqaro dorilar":
         await update.message.reply_text(
-            "⚙️ *Sozlamalar*",
-            reply_markup=keyboard,
+            "🌐 Xalqaro dori nomini kiriting:\n"
+            "Masalan: *Paracetamol*, *Ibuprofen*, *Amoxicillin*\n\n"
+            "⚠️ Ma'lumotlar FDA (AQSh) bazasidan olinadi",
             parse_mode=ParseMode.MARKDOWN
         )
+        return DORI_QIDIRISH  # Xuddi shu state, lekin keyin farqlaymiz
+    
+    elif text == "❓ Yordam":
+        help_text = (
+            "❓ *Yordam*\n\n"
+            "*📌 Qanday ishlatish:*\n"
+            "• Kerakli bo'limni tanlang\n"
+            "• Qidiruv so'zini kiriting\n"
+            "• Natijalardan birini tanlang\n\n"
+            "*🔍 Qidiruv bo'yicha maslahatlar:*\n"
+            "• Lotin yoki kirillda yozishingiz mumkin\n"
+            "• Qisqa nomlar bilan qidiring\n"
+            "• Aniq nomini bilmasangiz, bir qismini yozing\n\n"
+            "*📞 Aloqa:* @admin"
+        )
+        await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+    
+    return ASOSIY_MENYU
 
 async def handle_drug_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Dori qidiruvini boshqarish"""
-    drug_name = update.message.text.strip()
+    query = update.message.text.strip()
     
-    if drug_name == "🏠 Asosiy menyu":
-        await start(update, context)
-        return ConversationHandler.END
-    
-    searching = await update.message.reply_text(
-        f"🔍 *{drug_name}* qidirilmoqda...\n"
-        "🔄 Iltimos, biroz kuting",
-        parse_mode=ParseMode.MARKDOWN
-    )
-    
-    # Ma'lumotlarni yig'ish
-    data = await fetch_drug_full_data(drug_name)
-    
-    await searching.delete()
-    
-    if data["found"]:
-        text = format_drug_result(data)
+    # Xalqaro dori qidirish (agar /international komandasi bilan kelgan bo'lsa)
+    if context.user_data.get("search_mode") == "international":
+        searching = await update.message.reply_text(
+            f"🔍 '{query}' FDA bazasidan qidirilmoqda...\n"
+            "🌐 Bu bir necha soniya olishi mumkin"
+        )
         
-        # Foydalanuvchi lokatsiyasi bormi?
-        has_location = "location" in context.user_data
+        result = await search_openfda(query)
+        await searching.delete()
         
-        if data.get("image_url"):
-            try:
-                await update.message.reply_photo(
-                    photo=data["image_url"],
-                    caption=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=drug_action_keyboard(drug_name, has_location)
-                )
-            except:
-                await update.message.reply_text(
-                    text,
-                    parse_mode=ParseMode.MARKDOWN,
-                    reply_markup=drug_action_keyboard(drug_name, has_location)
-                )
+        if result:
+            text = format_drug_result(result)
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
         else:
             await update.message.reply_text(
+                f"❌ '{query}' FDA bazasida topilmadi.\n\n"
+                "Boshqa nom bilan urinib ko'ring."
+            )
+        
+        context.user_data.pop("search_mode", None)
+        return ASOSIY_MENYU
+    
+    # Oddiy dori qidirish
+    searching = await update.message.reply_text(f"🔍 '{query}' qidirilmoqda...")
+    
+    results = db.search_drugs(query)
+    await searching.delete()
+    
+    if results:
+        if len(results) == 1:
+            # Bitta natija bo'lsa, to'g'ridan-to'g'ri ko'rsatish
+            text = format_drug_result(results[0])
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            # Bir nechta natija bo'lsa, ro'yxat ko'rsatish
+            text = format_search_results(results, query, "drug")
+            
+            # Tugmalar yaratish
+            keyboard = []
+            for i, result in enumerate(results[:10], 1):
+                keyboard.append([InlineKeyboardButton(
+                    f"{i}. {result['name'][:50]}",
+                    callback_data=f"drug_select:{i-1}"
+                )])
+            
+            keyboard.append([InlineKeyboardButton("🔍 Yangi qidiruv", callback_data="new_search")])
+            
+            # Natijalarni contextga saqlash
+            context.user_data["last_search"] = results
+            
+            await update.message.reply_text(
                 text,
-                parse_mode=ParseMode.MARKDOWN,
-                reply_markup=drug_action_keyboard(drug_name, has_location)
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
             )
     else:
-        text = (
-            f"❌ *{drug_name.upper()}* O'zbekiston aptekalarida topilmadi.\n\n"
+        await update.message.reply_text(
+            f"❌ '{query}' topilmadi.\n\n"
             "💡 *Takliflar:*\n"
             "• Nomni to'g'ri yozganingizni tekshiring\n"
             "• Qisqaroq nom bilan qidiring\n"
-            "• Lotin yoki kirill alifbosida yozing\n\n"
-            "🌍 *Xorijdan sotib olish:*\n"
-            "  • [eapteka.ru](https://eapteka.ru)\n"
-            "  • [apteka.ru](https://apteka.ru)\n"
-            "  • [iherb.com](https://iherb.com)\n\n"
-            "📦 Yetkazib berish: CDEK, DHL"
-        )
-        
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("🔄 Yangi qidiruv", callback_data="new_search")
-        ]])
-        
-        await update.message.reply_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN,
-            reply_markup=keyboard,
-            disable_web_page_preview=True
+            "• Lotin alifbosida yozing\n\n"
+            "Yoki '🌐 Xalqaro dorilar' bo'limida qidirib ko'ring"
         )
     
-    return ConversationHandler.END
+    return ASOSIY_MENYU
 
-async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Lokatsiyani qabul qilish"""
-    location = update.message.location
-    context.user_data["location"] = {"lat": location.latitude, "lon": location.longitude}
+async def handle_tech_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Tibbiy texnika qidiruvi"""
+    query = update.message.text.strip()
     
-    # Foydalanuvchini saqlash
-    user = update.effective_user
-    db.add_user(user.id, user.username, location)
+    searching = await update.message.reply_text(f"🔍 '{query}' qidirilmoqda...")
     
-    # Yaqin aptekalarni topish
-    pharmacies = find_nearby_pharmacies(location.latitude, location.longitude)
+    results = db.search_tech(query)
+    await searching.delete()
     
-    if pharmacies:
-        text = format_nearby_pharmacies(pharmacies)
-        
-        keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("📍 Xaritada ko'rish", callback_data="map")
-        ]])
-        
-        await update.message.reply_text(
-            text,
-            reply_markup=keyboard,
-            parse_mode=ParseMode.MARKDOWN
-        )
+    if results:
+        if len(results) == 1:
+            text = format_tech_result(results[0])
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            text = format_search_results(results, query, "tech")
+            
+            keyboard = []
+            for i, result in enumerate(results[:10], 1):
+                keyboard.append([InlineKeyboardButton(
+                    f"{i}. {result['name'][:50]}",
+                    callback_data=f"tech_select:{i-1}"
+                )])
+            
+            keyboard.append([InlineKeyboardButton("🔍 Yangi qidiruv", callback_data="new_search")])
+            
+            context.user_data["last_search"] = results
+            
+            await update.message.reply_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
     else:
         await update.message.reply_text(
-            "❌ Sizga yaqin aptekalar topilmadi.\n"
-            "Kattaroq radiusda qidirish uchun /start bosing."
+            f"❌ '{query}' bo'yicha tibbiy texnika topilmadi."
         )
     
-    await update.message.reply_text(
-        "🏠 Asosiy menyu",
-        reply_markup=main_menu_keyboard()
-    )
+    return ASOSIY_MENYU
+
+async def handle_diagnostic_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Diagnostika vositalari qidiruvi"""
+    query = update.message.text.strip()
     
-    return ConversationHandler.END
+    searching = await update.message.reply_text(f"🔍 '{query}' qidirilmoqda...")
+    
+    results = db.search_diagnostics(query)
+    await searching.delete()
+    
+    if results:
+        if len(results) == 1:
+            text = format_diagnostic_result(results[0])
+            await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+        else:
+            text = format_search_results(results, query, "diagnostic")
+            
+            keyboard = []
+            for i, result in enumerate(results[:10], 1):
+                keyboard.append([InlineKeyboardButton(
+                    f"{i}. {result['name'][:50]}",
+                    callback_data=f"diag_select:{i-1}"
+                )])
+            
+            keyboard.append([InlineKeyboardButton("🔍 Yangi qidiruv", callback_data="new_search")])
+            
+            context.user_data["last_search"] = results
+            
+            await update.message.reply_text(
+                text,
+                reply_markup=InlineKeyboardMarkup(keyboard),
+                parse_mode=ParseMode.MARKDOWN
+            )
+    else:
+        await update.message.reply_text(
+            f"❌ '{query}' bo'yicha diagnostika vositalari topilmadi."
+        )
+    
+    return ASOSIY_MENYU
 
 async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Callback query larni boshqarish"""
@@ -1066,167 +656,36 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     
     data = query.data
-    user = update.effective_user
+    results = context.user_data.get("last_search", [])
     
     if data == "new_search":
         await query.message.reply_text(
-            "🔍 Qidirmoqchi bo'lgan dori nomini yozing:"
+            "🔍 Yangi qidiruv so'zini kiriting:",
+            reply_markup=main_keyboard()
         )
+        return
     
-    elif data.startswith("nearby:"):
-        drug_name = data.split(":", 1)[1]
-        
-        if "location" in context.user_data:
-            loc = context.user_data["location"]
-            pharmacies = find_nearby_pharmacies(loc["lat"], loc["lon"])
-            
-            # Dori narxlarini qo'shish (demo)
-            for ph in pharmacies[:5]:
-                ph["price"] = 15000  # Demo narx
-            
-            text = format_nearby_pharmacies(pharmacies, drug_name)
-            
-            await query.message.reply_text(
-                text,
-                parse_mode=ParseMode.MARKDOWN
-            )
-        else:
-            await query.message.reply_text(
-                "📍 Iltimos, avval lokatsiyangizni yuboring.\n"
-                "Buning uchun '📍 Yaqin aptekalar' tugmasini bosing.",
-                reply_markup=location_keyboard()
-            )
+    elif data.startswith("drug_select:"):
+        idx = int(data.split(":")[1])
+        if 0 <= idx < len(results):
+            text = format_drug_result(results[idx])
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     
-    elif data.startswith("analogs:"):
-        drug_name = data.split(":", 1)[1].lower()
-        
-        # Analoglarni topish
-        analogs = []
-        for key, values in ANALOGS_DB.items():
-            if key in drug_name or drug_name in key:
-                analogs = values
-                break
-        
-        if analogs:
-            text = f"💊 *{drug_name.title()}* analoglari:\n\n"
-            for i, analog in enumerate(analogs, 1):
-                text += f"{i}. {analog}\n"
-            text += "\n⚠️ Analogni ishlatishdan oldin shifokor bilan maslahatlashing!"
-        else:
-            text = f"💊 {drug_name.title()} uchun analoglar topilmadi."
-        
-        await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
+    elif data.startswith("tech_select:"):
+        idx = int(data.split(":")[1])
+        if 0 <= idx < len(results):
+            text = format_tech_result(results[idx])
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
     
-    elif data.startswith("alert:"):
-        drug_name = data.split(":", 1)[1]
-        
-        await query.message.reply_text(
-            f"📊 *{drug_name}* uchun narx kuzatuvi\n\n"
-            "Qanday narxdan pastga tushganda xabar beraymi?",
-            reply_markup=alert_price_keyboard(drug_name),
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data.startswith("setalert:"):
-        _, drug_name, price_str = data.split(":")
-        target_price = int(price_str)
-        
-        alert_id = db.add_alert(user.id, drug_name, target_price)
-        
-        await query.message.reply_text(
-            f"✅ *Kuzatuv o'rnatildi!*\n\n"
-            f"💊 Dori: {drug_name}\n"
-            f"💰 Maqsadli narx: {target_price:,} so'm\n"
-            f"🆔 ID: `{alert_id}`\n\n"
-            f"Narx {target_price:,} so'mdan pastga tushganda xabar beraman.",
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data.startswith("rate:"):
-        parts = data.split(":")
-        drug_name = parts[1]
-        
-        if len(parts) == 3:
-            # Baholash
-            rating = int(parts[2])
-            db.add_review(drug_name, user.id, rating)
-            await query.message.reply_text(
-                f"✅ *Rahmat!*\n{drug_name} {rating}⭐ bilan baholandi."
-            )
-        else:
-            # Baholash so'rash
-            await query.message.reply_text(
-                f"⭐ *{drug_name}* ni baholang:",
-                reply_markup=rating_keyboard(drug_name)
-            )
-    
-    elif data == "new_alert":
-        await query.message.reply_text(
-            "🔍 Kuzatmoqchi bo'lgan dori nomini yozing:"
-        )
-        return NARX_KUZATUV
-    
-    elif data == "remove_alert":
-        alerts = db.get_alerts(user.id)
-        if alerts:
-            keyboard = []
-            for alert in alerts:
-                if alert["active"]:
-                    keyboard.append([InlineKeyboardButton(
-                        f"{alert['drug_name']} - {alert['target_price']} so'm",
-                        callback_data=f"remove:{alert['id']}"
-                    )])
-            keyboard.append([InlineKeyboardButton("◀️ Orqaga", callback_data="back_alerts")])
-            
-            await query.message.reply_text(
-                "❌ O'chirmoqchi bo'lgan kuzatuvni tanlang:",
-                reply_markup=InlineKeyboardMarkup(keyboard)
-            )
-    
-    elif data.startswith("remove:"):
-        alert_id = data.split(":", 1)[1]
-        db.remove_alert(user.id, alert_id)
-        await query.message.reply_text("✅ Kuzatuv o'chirildi!")
-    
-    elif data == "back_alerts":
-        alerts = db.get_alerts(user.id)
-        text = format_alerts(alerts)
-        await query.message.edit_text(
-            text,
-            parse_mode=ParseMode.MARKDOWN
-        )
-    
-    elif data == "map":
-        if "location" in context.user_data:
-            loc = context.user_data["location"]
-            pharmacies = find_nearby_pharmacies(loc["lat"], loc["lon"])
-            
-            # Birinchi apteka lokatsiyasini yuborish
-            if pharmacies:
-                ph = pharmacies[0]
-                await query.message.reply_location(
-                    latitude=ph["lat"],
-                    longitude=ph["lon"]
-                )
+    elif data.startswith("diag_select:"):
+        idx = int(data.split(":")[1])
+        if 0 <= idx < len(results):
+            text = format_diagnostic_result(results[idx])
+            await query.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
-async def notifications_checker(context: ContextTypes.DEFAULT_TYPE):
-    """Narxlarni tekshirish va xabar yuborish"""
-    # Bu funksiyani periodik ishga tushirish kerak
-    pass
-
-# ─────────────────────────────────────────
+# ============================================================================
 # MAIN
-# ─────────────────────────────────────────
-
-async def notifications_checker(context: ContextTypes.DEFAULT_TYPE):
-    """Narxlarni tekshirish va xabar yuborish"""
-    # Bu funksiyani periodik ishga tushirish kerak
-    try:
-        logger.info("📊 Narxlar tekshirilmoqda...")
-        # Hozircha bo'sh, keyinroq to'ldiramiz
-        pass
-    except Exception as e:
-        logger.error(f"❌ notifications_checker xatosi: {e}")
+# ============================================================================
 
 def main():
     """Asosiy funksiya"""
@@ -1235,36 +694,24 @@ def main():
     # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[
-            MessageHandler(filters.Regex("^(💊 Dori qidirish|📍 Yaqin aptekalar)$"), handle_menu),
+            MessageHandler(filters.Regex("^(💊 Dori qidirish|⚕️ Tibbiy texnika|🔬 Diagnostika|🌐 Xalqaro dorilar)$"), handle_menu),
         ],
         states={
-            DORI_NOMI_KUTISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_drug_search)],
-            LOKATSIYA_KUTISH: [MessageHandler(filters.LOCATION, handle_location)],
-            NARX_KUZATUV: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_drug_search)],
+            DORI_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_drug_search)],
+            TEXNIKA_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_tech_search)],
+            DIAGNOSTIKA_QIDIRISH: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_diagnostic_search)],
         },
         fallbacks=[CommandHandler("start", start)],
+        per_message=False,
     )
     
     # Handlerlarni qo'shish
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(conv_handler)
     app.add_handler(CallbackQueryHandler(handle_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_menu))
     
-    # JobQueue ni xavfsiz ishlatish
-    try:
-        job_queue = app.job_queue
-        if job_queue:
-            # Agar JobQueue o'rnatilgan bo'lsa, ishga tushiramiz
-            # job_queue.run_repeating(notifications_checker, interval=3600, first=10)
-            logger.info("✅ JobQueue tayyor (hozircha o'chirilgan)")
-        else:
-            logger.info("⚠️ JobQueue mavjud emas (o'rnatilmagan)")
-    except Exception as e:
-        logger.warning(f"⚠️ JobQueue tekshirish xatosi: {e}")
-    
-    logger.info("🤖 Dori Bot v3.0 ishga tushdi!")
+    logger.info("🤖 Dori Bot v4.0 (Rasmiy ma'lumotlar) ishga tushdi!")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
